@@ -2,6 +2,7 @@ package expr
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"goa.design/goa/v3/eval"
@@ -212,6 +213,7 @@ func (a *AttributeExpr) Validate(ctx string, parent eval.Expression) *eval.Valid
 	if v := a.Validation; v != nil {
 		verr.Merge(v.Validate(ctx, parent))
 	}
+	verr.Merge(a.validateExamples(ctx, parent))
 	if o := AsObject(a.Type); o != nil {
 		for _, n := range a.AllRequired() {
 			if a.Find(n) == nil {
@@ -225,17 +227,7 @@ func (a *AttributeExpr) Validate(ctx string, parent eval.Expression) *eval.Valid
 			}
 		}
 		for _, nat := range *o {
-			if ut, ok := nat.Attribute.Type.(UserType); pkgPath != "" && ok {
-				// This check ensures we error if a sub-type has a different custom package type set
-				// or if two user types have different custom packages but share a sub-type (field that's a user type)
-				if ut.Attribute().Meta != nil &&
-					ut.Attribute().Meta["struct:pkg:path"] != nil &&
-					ut.Attribute().Meta["struct:pkg:path"][0] != pkgPath {
-					verr.Add(a, "type \"%s\" has conflicting packages %s and %s", ut.Name(), ut.Attribute().Meta["struct:pkg:path"][0], pkgPath)
-				}
-
-				ut.Attribute().AddMeta("struct:pkg:path", pkgPath)
-			}
+			verr.Merge(a.validatePkgPath(pkgPath, nat.Attribute.Type))
 			ctx = fmt.Sprintf("field %s", nat.Name)
 			verr.Merge(nat.Attribute.Validate(ctx, parent))
 		}
@@ -253,26 +245,51 @@ func (a *AttributeExpr) Validate(ctx string, parent eval.Expression) *eval.Valid
 		}
 	}
 
-	if views, ok := a.Meta["view"]; ok {
+	if view, ok := a.Meta.Last(ViewMetaKey); ok {
 		rt, ok := a.Type.(*ResultTypeExpr)
 		if !ok {
-			verr.Add(parent, "%s uses view %q but %q is not a result type", ctx, views[0], a.Type.Name())
+			verr.Add(parent, "%s uses view %q but %q is not a result type", ctx, view, a.Type.Name())
 		}
-		if name := views[0]; name != "default" && rt != nil {
+		if view != DefaultView && rt != nil {
 			found := false
 			for _, v := range rt.Views {
-				if v.Name == name {
+				if v.Name == view {
 					found = true
 					break
 				}
 			}
 			if !found {
-				verr.Add(parent, "%s: type %q does not define view %q", ctx, a.Type.Name(), name)
+				verr.Add(parent, "%s: type %q does not define view %q", ctx, a.Type.Name(), view)
 			}
 		}
 	}
 
 	return verr
+}
+
+func (a *AttributeExpr) validatePkgPath(pkgPath string, t DataType) *eval.ValidationErrors {
+	verr := new(eval.ValidationErrors)
+	if ar := AsArray(t); ar != nil {
+		verr.Merge(a.validatePkgPath(pkgPath, ar.ElemType.Type))
+	}
+	if mp := AsMap(t); mp != nil {
+		verr.Merge(a.validatePkgPath(pkgPath, mp.KeyType.Type))
+		verr.Merge(a.validatePkgPath(pkgPath, mp.ElemType.Type))
+	}
+	if ut, ok := t.(UserType); pkgPath != "" && ok {
+		// This check ensures we error if a sub-type has a different custom package type set
+		// or if two user types have different custom packages but share a sub-type (field that's a user type)
+		if ut.Attribute().Meta != nil &&
+			ut.Attribute().Meta["struct:pkg:path"] != nil &&
+			ut.Attribute().Meta["struct:pkg:path"][0] != pkgPath {
+			verr.Add(a, "type \"%s\" has conflicting packages %s and %s", ut.Name(), ut.Attribute().Meta["struct:pkg:path"][0], pkgPath)
+		}
+		ut.Attribute().AddMeta("struct:pkg:path", pkgPath)
+	}
+	if len(verr.Errors) > 0 {
+		return verr
+	}
+	return nil
 }
 
 // Finalize merges base and reference type attributes and finalizes the Type
@@ -282,8 +299,12 @@ func (a *AttributeExpr) Finalize() {
 		return // Avoid infinite recursion.
 	}
 	a.finalized = true
+	var pkgPath string
 	if ut, ok := a.Type.(UserType); ok {
 		ut.Finalize()
+		if meta, ok := ut.Attribute().Meta["struct:pkg:path"]; ok {
+			pkgPath = meta[0]
+		}
 	}
 	switch {
 	case IsObject(a.Type):
@@ -301,12 +322,12 @@ func (a *AttributeExpr) Finalize() {
 			}
 			a.Merge(ru.Attribute())
 		}
-		var pkgPath string
-		if ut, ok := a.Type.(UserType); ok {
-			if meta, ok := ut.Attribute().Meta["struct:pkg:path"]; ok {
-				pkgPath = meta[0]
-			}
-		}
+
+		// Now that we've merged the bases, we can clear them.  This
+		// avoids issues where the bases are dupped and modifications
+		// made to the originals are not reflected in the dups.
+		a.Bases = nil
+
 		for _, nat := range *AsObject(a.Type) {
 			if pkgPath != "" {
 				if u := AsUnion(nat.Attribute.Type); u != nil {
@@ -399,12 +420,7 @@ func (a *AttributeExpr) AllRequired() []string {
 // attribute, false otherwise. This method only applies to attributes of type
 // Object.
 func (a *AttributeExpr) IsRequired(attName string) bool {
-	for _, name := range a.AllRequired() {
-		if name == attName {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(a.AllRequired(), attName)
 }
 
 // IsRequiredNoDefault returns true if the given string matches the name of a
@@ -645,7 +661,7 @@ func (a *AttributeExpr) debug(prefix string, seen map[*AttributeExpr]int, indent
 	if rt, ok := a.Type.(*ResultTypeExpr); ok {
 		fmt.Printf("%s%sviews\n", tabs, tab)
 		for _, v := range rt.Views {
-			nats := *AsObject(v.AttributeExpr.Type)
+			nats := *AsObject(v.Type)
 			keys := make([]string, len(nats))
 			for i, n := range nats {
 				keys[i] = n.Name
@@ -696,11 +712,8 @@ func (a *AttributeExpr) validateEnumDefault(ctx string, parent eval.Expression) 
 	verr := new(eval.ValidationErrors)
 	if a.DefaultValue != nil && a.Validation != nil && a.Validation.Values != nil {
 		var found bool
-		for _, e := range a.Validation.Values {
-			if e == a.DefaultValue {
-				found = true
-				break
-			}
+		if slices.Contains(a.Validation.Values, a.DefaultValue) {
+			found = true
 		}
 		if !found {
 			verr.Add(
@@ -710,6 +723,18 @@ func (a *AttributeExpr) validateEnumDefault(ctx string, parent eval.Expression) 
 				a.DefaultValue,
 				a.Validation.Values,
 			)
+		}
+	}
+	return verr
+}
+
+// validateExamples makes sure that the attribute example values are compatible
+// with the attribute type.
+func (a *AttributeExpr) validateExamples(ctx string, parent eval.Expression) *eval.ValidationErrors {
+	verr := new(eval.ValidationErrors)
+	for _, ex := range a.UserExamples {
+		if !a.Type.IsCompatible(ex.Value) { // DSL ensures ex.Value is not nil
+			verr.Add(parent, "%sexample value %#v is incompatible with type %s", ctx, ex.Value, a.Type.Name())
 		}
 	}
 	return verr
@@ -833,13 +858,7 @@ func (v *ValidationExpr) Merge(other *ValidationExpr) {
 // AddRequired merges the required fields into v.
 func (v *ValidationExpr) AddRequired(required ...string) {
 	for _, r := range required {
-		found := false
-		for _, rr := range v.Required {
-			if r == rr {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(v.Required, r)
 		if !found {
 			v.Required = append(v.Required, r)
 		}

@@ -8,10 +8,10 @@ import (
 )
 
 // ClientTypeFiles returns the HTTP transport client types files.
-func ClientTypeFiles(genpkg string, root *expr.RootExpr) []*codegen.File {
-	fw := make([]*codegen.File, len(root.API.HTTP.Services))
-	for i, svc := range root.API.HTTP.Services {
-		fw[i] = clientType(genpkg, svc, make(map[string]struct{}))
+func ClientTypeFiles(genpkg string, data *ServicesData) []*codegen.File {
+	fw := make([]*codegen.File, len(data.Expressions.Services))
+	for i, svc := range data.Expressions.Services {
+		fw[i] = clientType(genpkg, svc, make(map[string]struct{}), data)
 	}
 	return fw
 }
@@ -25,26 +25,25 @@ func ClientTypeFiles(genpkg string, root *expr.RootExpr) []*codegen.File {
 // slices, maps or objects always use pointers either implicitly - slices and
 // maps - or explicitly - objects.
 //
-//   * The payload struct fields (if a struct) hold pointers when not required
+//   - The payload struct fields (if a struct) hold pointers when not required
 //     and have no default value.
 //
-//   * Request and response body fields (if the body is a struct) always hold
+//   - Request and response body fields (if the body is a struct) always hold
 //     pointers to allow for explicit validation.
 //
-//   * Request header, path and query string parameter variables hold pointers
+//   - Request header, path and query string parameter variables hold pointers
 //     when not required. Request header, body fields and param variables that
 //     have default values are never required (enforced by DSL engine).
 //
-//   * The result struct fields (if a struct) hold pointers when not required
+//   - The result struct fields (if a struct) hold pointers when not required
 //     or have a default value (so generated code can set when null).
 //
-//   * Response header variables hold pointers when not required and have no
+//   - Response header variables hold pointers when not required and have no
 //     default value.
-//
-func clientType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct{}) *codegen.File {
+func clientType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct{}, services *ServicesData) *codegen.File {
 	var (
 		path    string
-		data    = HTTPServices.Get(svc.Name())
+		data    = services.Get(svc.Name())
 		svcName = data.Service.PathName
 	)
 	path = filepath.Join(codegen.Gendir, "http", svcName, "client", "types.go")
@@ -55,12 +54,13 @@ func clientType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 		{Path: genpkg + "/" + svcName + "/" + "views", Name: data.Service.ViewsPkg},
 		codegen.GoaImport(""),
 	}
-	imports = append(imports, data.Service.UserTypeImports...)
 	header := codegen.Header(svc.Name()+" HTTP client types", "client", imports)
 
 	var (
 		initData       []*InitData
 		validatedTypes []*TypeData
+		seenValidated  = make(map[string]struct{}) // Track validated types to avoid duplicates
+		seenInit       = make(map[string]struct{}) // Track init functions to avoid duplicates
 
 		sections = []*codegen.SectionTemplate{header}
 	)
@@ -76,15 +76,21 @@ func clientType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 			if data.Def != "" {
 				sections = append(sections, &codegen.SectionTemplate{
 					Name:   "client-request-body",
-					Source: typeDeclT,
+					Source: httpTemplates.Read(typeDeclT),
 					Data:   data,
 				})
 			}
 			if data.Init != nil {
-				initData = append(initData, data.Init)
+				if _, ok := seenInit[data.Init.Name]; !ok {
+					seenInit[data.Init.Name] = struct{}{}
+					initData = append(initData, data.Init)
+				}
 			}
 			if data.ValidateDef != "" {
-				validatedTypes = append(validatedTypes, data)
+				if _, ok := seenValidated[data.Name]; !ok {
+					seenValidated[data.Name] = struct{}{}
+					validatedTypes = append(validatedTypes, data)
+				}
 			}
 		}
 		if adata.ClientWebSocket != nil {
@@ -96,7 +102,7 @@ func clientType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 				if data.Def != "" {
 					sections = append(sections, &codegen.SectionTemplate{
 						Name:   "client-request-body",
-						Source: typeDeclT,
+						Source: httpTemplates.Read(typeDeclT),
 						Data:   data,
 					})
 				}
@@ -104,7 +110,10 @@ func clientType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 					initData = append(initData, data.Init)
 				}
 				if data.ValidateDef != "" {
-					validatedTypes = append(validatedTypes, data)
+					if _, ok := seenValidated[data.Name]; !ok {
+						seenValidated[data.Name] = struct{}{}
+						validatedTypes = append(validatedTypes, data)
+					}
 				}
 			}
 		}
@@ -122,12 +131,15 @@ func clientType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 				if data.Def != "" {
 					sections = append(sections, &codegen.SectionTemplate{
 						Name:   "client-response-body",
-						Source: typeDeclT,
+						Source: httpTemplates.Read(typeDeclT),
 						Data:   data,
 					})
 				}
 				if data.ValidateDef != "" {
-					validatedTypes = append(validatedTypes, data)
+					if _, ok := seenValidated[data.Name]; !ok {
+						seenValidated[data.Name] = struct{}{}
+						validatedTypes = append(validatedTypes, data)
+					}
 				}
 			}
 		}
@@ -146,12 +158,15 @@ func clientType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 					if data.Def != "" {
 						sections = append(sections, &codegen.SectionTemplate{
 							Name:   "client-error-body",
-							Source: typeDeclT,
+							Source: httpTemplates.Read(typeDeclT),
 							Data:   data,
 						})
 					}
 					if data.ValidateDef != "" {
-						validatedTypes = append(validatedTypes, data)
+						if _, ok := seenValidated[data.Name]; !ok {
+							seenValidated[data.Name] = struct{}{}
+							validatedTypes = append(validatedTypes, data)
+						}
 					}
 				}
 			}
@@ -159,16 +174,25 @@ func clientType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 	}
 
 	for _, data := range data.ClientBodyAttributeTypes {
+		// Check if this type has already been added to avoid duplicates
+		if _, ok := seen[data.Name]; ok {
+			continue
+		}
+		seen[data.Name] = struct{}{}
+
 		if data.Def != "" {
 			sections = append(sections, &codegen.SectionTemplate{
 				Name:   "client-body-attributes",
-				Source: typeDeclT,
+				Source: httpTemplates.Read(typeDeclT),
 				Data:   data,
 			})
 		}
 
 		if data.ValidateDef != "" {
-			validatedTypes = append(validatedTypes, data)
+			if _, ok := seenValidated[data.Name]; !ok {
+				seenValidated[data.Name] = struct{}{}
+				validatedTypes = append(validatedTypes, data)
+			}
 		}
 	}
 
@@ -176,21 +200,27 @@ func clientType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 	for _, init := range initData {
 		sections = append(sections, &codegen.SectionTemplate{
 			Name:   "client-body-init",
-			Source: clientBodyInitT,
+			Source: httpTemplates.Read(clientBodyInitT),
 			Data:   init,
 		})
 	}
+
+	// Track generated init functions to avoid duplicates
+	seenInits := make(map[string]struct{})
 
 	for _, adata := range data.Endpoints {
 		// response to method result (client)
 		for _, resp := range adata.Result.Responses {
 			if init := resp.ResultInit; init != nil {
-				sections = append(sections, &codegen.SectionTemplate{
-					Name:    "client-result-init",
-					Source:  clientTypeInitT,
-					Data:    init,
-					FuncMap: map[string]any{"fieldCode": fieldCode},
-				})
+				if _, ok := seenInits[init.Name]; !ok {
+					seenInits[init.Name] = struct{}{}
+					sections = append(sections, &codegen.SectionTemplate{
+						Name:    "client-result-init",
+						Source:  httpTemplates.Read(clientTypeInitT),
+						Data:    init,
+						FuncMap: map[string]any{"fieldCode": fieldCode},
+					})
+				}
 			}
 		}
 
@@ -198,12 +228,15 @@ func clientType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 		for _, gerr := range adata.Errors {
 			for _, herr := range gerr.Errors {
 				if init := herr.Response.ResultInit; init != nil {
-					sections = append(sections, &codegen.SectionTemplate{
-						Name:    "client-error-result-init",
-						Source:  clientTypeInitT,
-						Data:    init,
-						FuncMap: map[string]any{"fieldCode": fieldCode},
-					})
+					if _, ok := seenInits[init.Name]; !ok {
+						seenInits[init.Name] = struct{}{}
+						sections = append(sections, &codegen.SectionTemplate{
+							Name:    "client-error-result-init",
+							Source:  httpTemplates.Read(clientTypeInitT),
+							Data:    init,
+							FuncMap: map[string]any{"fieldCode": fieldCode},
+						})
+					}
 				}
 			}
 		}
@@ -214,38 +247,9 @@ func clientType(genpkg string, svc *expr.HTTPServiceExpr, seen map[string]struct
 	for _, data := range validatedTypes {
 		sections = append(sections, &codegen.SectionTemplate{
 			Name:   "client-validate",
-			Source: validateT,
+			Source: httpTemplates.Read(validateT),
 			Data:   data,
 		})
 	}
 	return &codegen.File{Path: path, SectionTemplates: sections}
 }
-
-// input: InitData
-const clientBodyInitT = `{{ comment .Description }}
-func {{ .Name }}({{ range .ClientArgs }}{{ .VarName }} {{.TypeRef }}, {{ end }}) {{ .ReturnTypeRef }} {
-	{{ .ClientCode }}
-	return body
-}
-`
-
-// input: InitData
-const clientTypeInitT = `{{ comment .Description }}
-func {{ .Name }}({{- range .ClientArgs }}{{ .VarName }} {{ .TypeRef }}, {{ end }}) {{ .ReturnTypeRef }} {
-{{- if .ClientCode }}
-	{{ .ClientCode }}
-	{{- if .ReturnTypeAttribute }}
-		res := &{{ .ReturnTypeName }}{
-			{{ .ReturnTypeAttribute }}: {{ if .ReturnIsPrimitivePointer }}&{{ end }}v,
-		}
-	{{- end }}
-{{- end }}
-{{- if .ReturnIsStruct }}
-	{{- if not .ClientCode }}
-	{{ if .ReturnTypeAttribute }}res{{ else }}v{{ end }} := &{{ .ReturnTypeName }}{}
-	{{- end }}
-{{- end }}
-	{{ fieldCode . "client" }}
-	return {{ if .ReturnTypeAttribute }}res{{ else }}v{{ end }}
-}
-`

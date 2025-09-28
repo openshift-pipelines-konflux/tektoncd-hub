@@ -37,6 +37,9 @@ type unionData struct {
 	SourceValues        []*expr.NamedAttributeExpr
 	TargetValues        []*expr.NamedAttributeExpr
 	SourceValueTypeRefs []string
+	// TargetWrapperRefs holds wrapper type refs used when assigning from
+	// protobuf to Go union (proto -> Go). Empty string means no wrapper.
+	TargetWrapperRefs []string
 }
 
 var (
@@ -55,11 +58,14 @@ var (
 
 // NOTE: can't initialize inline because https://github.com/golang/go/issues/1817
 func init() {
-	fm := template.FuncMap{"transformAttribute": transformAttribute, "convertType": convertType}
-	transformGoArrayT = template.Must(template.New("transformGoArray").Funcs(fm).Parse(transformGoArrayTmpl))
-	transformGoMapT = template.Must(template.New("transformGoMap").Funcs(fm).Parse(transformGoMapTmpl))
-	transformGoUnionToProtoT = template.Must(template.New("transformGoUnionToProto").Funcs(fm).Parse(transformGoUnionToProtoTmpl))
-	transformGoUnionFromProtoT = template.Must(template.New("transformGoUnionFromProto").Funcs(fm).Parse(transformGoUnionFromProtoTmpl))
+	fm := template.FuncMap{
+		"transformAttribute": transformAttribute,
+		"convertType":        convertType,
+	}
+	transformGoArrayT = template.Must(template.New("transformGoArray").Funcs(fm).Parse(grpcTemplates.Read(grpcTransformGoArrayT)))
+	transformGoMapT = template.Must(template.New("transformGoMap").Funcs(fm).Parse(grpcTemplates.Read(grpcTransformGoMapT)))
+	transformGoUnionToProtoT = template.Must(template.New("transformGoUnionToProto").Funcs(fm).Parse(grpcTemplates.Read(grpcTransformGoUnionToProtoT)))
+	transformGoUnionFromProtoT = template.Must(template.New("transformGoUnionFromProto").Funcs(fm).Parse(grpcTemplates.Read(grpcTransformGoUnionFromProtoT)))
 }
 
 // protoBufTransform produces Go code to initialize a data structure defined
@@ -85,12 +91,12 @@ func protoBufTransform(source, target *expr.AttributeExpr, sourceVar, targetVar 
 	if proto {
 		target = expr.DupAtt(target)
 		removeMeta(target)
-		ta.TransformAttrs.Prefix = "svc"
+		ta.Prefix = "svc"
 		ta.proto = true
 	} else {
 		source = expr.DupAtt(source)
 		removeMeta(source)
-		ta.TransformAttrs.Prefix = "protobuf"
+		ta.Prefix = "protobuf"
 		ta.proto = false
 	}
 
@@ -185,6 +191,10 @@ func transformAttribute(source, target *expr.AttributeExpr, sourceVar, targetVar
 	if err != nil {
 		return "", err
 	}
+	// Ensure code ends with newline for proper formatting when used in templates
+	if code != "" && !strings.HasSuffix(code, "\n") {
+		code += "\n"
+	}
 	return initCode + code, nil
 }
 
@@ -268,7 +278,7 @@ func transformObject(source, target *expr.AttributeExpr, sourceVar, targetVar st
 		assign = ":="
 	}
 	tname := ta.TargetCtx.Scope.Name(target, ta.TargetCtx.Pkg(target), ta.TargetCtx.Pointer, ta.TargetCtx.UseDefault)
-	buffer.WriteString(fmt.Sprintf("%s %s %s%s{%s}\n", targetVar, assign, deref, tname, initCode))
+	fmt.Fprintf(buffer, "%s %s %s%s{%s}\n", targetVar, assign, deref, tname, initCode)
 	buffer.WriteString(postInitCode)
 
 	// iterate through attributes to initialize rest of the struct fields and
@@ -595,6 +605,7 @@ func transformUnionFromProto(source, target *expr.AttributeExpr, sourceVar, targ
 		"SourceValues":        tdata.SourceValues,
 		"TargetValues":        tdata.TargetValues,
 		"TransformAttrs":      ta,
+		"TargetWrapperRefs":   tdata.TargetWrapperRefs,
 	}
 	var buf bytes.Buffer
 	if err := transformGoUnionFromProtoT.Execute(&buf, data); err != nil {
@@ -667,12 +678,106 @@ func transformUnionData(source, target *expr.AttributeExpr, ta *transformAttrs) 
 	copy(tgtValues, tgt.Values)
 
 	sourceValueTypeRefs := make([]string, len(src.Values))
-	for i, v := range src.Values {
-		if ta.proto {
-			sourceValueTypeRefs[i] = ta.SourceCtx.Scope.Ref(v.Attribute, ta.SourceCtx.Pkg(v.Attribute))
-		} else {
+	targetWrapperRefs := make([]string, len(src.Values))
+	if ta.proto {
+		// Go -> protobuf: when union members are user types, switch on the
+		// actual user type rather than synthetic wrapper types. Only non-user
+		// types (primitives, maps, arrays) require per-branch wrapper types.
+		unionPkg := ta.SourceCtx.Pkg(source)
+		samePkg := true
+		commonPkg := ""
+		for _, v := range src.Values {
+			ut, ok := v.Attribute.Type.(expr.UserType)
+			if !ok {
+				samePkg = false
+				break
+			}
+			if loc := codegen.UserTypeLocation(ut); loc != nil {
+				if commonPkg == "" {
+					commonPkg = loc.PackageName()
+				} else if commonPkg != loc.PackageName() {
+					samePkg = false
+					break
+				}
+			} else {
+				samePkg = false
+				break
+			}
+		}
+		for i, v := range src.Values {
+			if _, ok := v.Attribute.Type.(expr.UserType); ok {
+				sourceValueTypeRefs[i] = ta.SourceCtx.Scope.Ref(v.Attribute, ta.SourceCtx.Pkg(v.Attribute))
+				continue
+			}
+			// Non-user types are represented via per-branch defined wrapper types.
+			w := codegen.Goify(src.Name(), true) + codegen.Goify(v.Name, true)
+			pkg := unionPkg
+			if samePkg && commonPkg != "" {
+				pkg = commonPkg
+			}
+			if pkg != "" {
+				sourceValueTypeRefs[i] = pkg + "." + w
+			} else {
+				sourceValueTypeRefs[i] = w
+			}
+		}
+	} else {
+		// Protobuf -> Go: switch on protobuf oneof variants and cast converted
+		// value into Go-side wrappers when required.
+		for i, v := range src.Values {
 			fieldName := ta.SourceCtx.Scope.Field(v.Attribute, v.Name, true)
 			sourceValueTypeRefs[i] = ta.message + "_" + fieldName
+		}
+		// Determine the union package for the target side. For anonymous
+		// unions embedded in objects the package may be empty. In that case
+		// we must not force per-branch wrappers solely based on package
+		// comparison; instead rely on duplicate-type detection and whether
+		// the member is a non-user type.
+		unionPkg := ta.TargetCtx.Pkg(target)
+		// Prefer a common member package for wrappers if all target values share it (e.g., shared user-type unions).
+		samePkg := true
+		commonPkg := ""
+		for _, tv := range tgt.Values {
+			ut, ok := tv.Attribute.Type.(expr.UserType)
+			if !ok {
+				samePkg = false
+				break
+			}
+			if loc := codegen.UserTypeLocation(ut); loc != nil {
+				if commonPkg == "" {
+					commonPkg = loc.PackageName()
+				} else if commonPkg != loc.PackageName() {
+					samePkg = false
+					break
+				}
+			} else {
+				samePkg = false
+				break
+			}
+		}
+		// For protobuf -> Go transforms, when union members are user types,
+		// prefer assigning the converted user type directly to the union
+		// interface. This avoids generating synthetic per-branch wrapper
+		// types (e.g., DetailsFoo) which do not exist in the target package
+		// unless transport-agnostic codegen created them. Only non-user types
+		// require wrappers.
+		for i, tv := range tgt.Values {
+			useWrapper := false
+			if _, ok := tv.Attribute.Type.(expr.UserType); !ok {
+				useWrapper = true
+			}
+			if useWrapper {
+				w := codegen.Goify(tgt.Name(), true) + codegen.Goify(tv.Name, true)
+				pkg := unionPkg
+				if samePkg && commonPkg != "" {
+					pkg = commonPkg
+				}
+				if pkg != "" {
+					targetWrapperRefs[i] = pkg + "." + w
+				} else {
+					targetWrapperRefs[i] = w
+				}
+			}
 		}
 	}
 	return &unionData{
@@ -681,6 +786,7 @@ func transformUnionData(source, target *expr.AttributeExpr, ta *transformAttrs) 
 		SourceValues:        srcValues,
 		TargetValues:        tgtValues,
 		SourceValueTypeRefs: sourceValueTypeRefs,
+		TargetWrapperRefs:   targetWrapperRefs,
 	}
 }
 
@@ -963,37 +1069,3 @@ func dupTransformAttrs(ta *transformAttrs) *transformAttrs {
 		message:        ta.message,
 	}
 }
-
-const (
-	transformGoArrayTmpl = `{{ .TargetVar }} {{ if .NewVar }}:={{ else }}={{ end }} make([]{{ .ElemTypeRef }}, len({{ .SourceVar }})) 
-for {{ .LoopVar }}{{ if .ValVar }}, {{ .ValVar }}{{ end }} := range {{ .SourceVar }} {
-  {{ transformAttribute .SourceElem .TargetElem "val" (printf "%s[%s]" .TargetVar .LoopVar) false .TransformAttrs -}}
-}
-`
-
-	transformGoMapTmpl = `{{ .TargetVar }} {{ if .NewVar }}:={{ else }}={{ end }} make(map[{{ .KeyTypeRef }}]{{ .ElemTypeRef }}, len({{ .SourceVar }}))
-for key, val := range {{ .SourceVar }} {
-  {{ transformAttribute .SourceKey .TargetKey "key" "tk" true .TransformAttrs -}}
-  {{ transformAttribute .SourceElem .TargetElem "val" (printf "tv%s" .LoopVar) true .TransformAttrs -}}
-  {{ .TargetVar }}[tk] = {{ printf "tv%s" .LoopVar }}
-}
-`
-
-	transformGoUnionToProtoTmpl = `switch src := {{ .SourceVar }}.(type) {
-{{- range $i, $ref := .SourceValueTypeRefs }}
-case {{ . }}:
-		{{- $val := (convertType (index $.SourceValues $i).Attribute (index $.TargetValues $i).Attribute false false "src" $.TransformAttrs) }}
-		{{ $.TargetVar }} = &{{ index $.TargetValueTypeNames $i }}{ {{ (index $.TargetFieldNames $i) }}: {{ $val }} }
-{{- end }}
-}
-`
-
-	transformGoUnionFromProtoTmpl = `switch val := {{ .SourceVar }}.(type) {
-{{- range $i, $ref := .SourceValueTypeRefs }}
-case {{ . }}:
-	{{- $field := (print "val." (index $.SourceFieldNames $i)) }}
-	{{ $.TargetVar }} = {{ convertType (index $.SourceValues $i).Attribute (index $.TargetValues $i).Attribute false false $field $.TransformAttrs }}
-{{- end }}
-}
-`
-)

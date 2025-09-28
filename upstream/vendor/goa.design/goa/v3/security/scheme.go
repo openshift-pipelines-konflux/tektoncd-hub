@@ -1,16 +1,18 @@
-/*Package security contains the types used by the code generators to
+/*
+Package security contains the types used by the code generators to
 secure goa endpoint. It supports the following security schemes:
 
-  * Basic security using usernames and passwords.
-  * API key security using keys.
-  * JWT security using JWT tokens.
-  * OAuth2 security using OAuth2 tokens.
+  - Basic security using usernames and passwords.
+  - API key security using keys.
+  - JWT security using JWT tokens.
+  - OAuth2 security using OAuth2 tokens.
 */
 package security
 
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -120,13 +122,7 @@ func (s *JWTScheme) Validate(scopes []string) error {
 func validateScopes(expected, actual []string) error {
 	var missing []string
 	for _, r := range expected {
-		found := false
-		for _, s := range actual {
-			if s == r {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(actual, r)
 		if !found {
 			missing = append(missing, r)
 		}

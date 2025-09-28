@@ -186,14 +186,26 @@ func (r *GRPCResponseExpr) Finalize(a *GRPCEndpointExpr, svcAtt *AttributeExpr) 
 				nat.Attribute.Meta.Merge(svcAtt.Meta)
 			}
 		}
+		if ut, ok := svcAtt.Type.(UserType); ok {
+			// propagate the user set protobuf struct name from the user type to
+			// the request message.
+			if proto, ok := ut.Attribute().Meta.Last("struct:name:proto"); ok {
+				if r.Message.Meta == nil {
+					r.Message.Meta = ut.Attribute().Meta
+				} else {
+					r.Message.Meta["struct:name:proto"] = []string{proto}
+				}
+			}
+		}
 	} else {
 		// method result is not an object type. Initialize response header or
 		// trailer metadata if defined or else initialize response message.
-		if !r.Headers.IsEmpty() {
+		switch {
+		case !r.Headers.IsEmpty():
 			initAttrFromDesign(r.Headers.AttributeExpr, svcAtt)
-		} else if !r.Trailers.IsEmpty() {
+		case !r.Trailers.IsEmpty():
 			initAttrFromDesign(r.Trailers.AttributeExpr, svcAtt)
-		} else {
+		default:
 			initAttrFromDesign(r.Message, svcAtt)
 		}
 	}

@@ -164,7 +164,7 @@ func APISchema(api *expr.APIExpr, r *expr.RootExpr) *Schema {
 }
 
 // GenerateServiceDefinition produces the JSON schema corresponding to the given
-// service. It stores the results in cachedSchema.
+// service. It stores the results in Definitions.
 func GenerateServiceDefinition(api *expr.APIExpr, res *expr.HTTPServiceExpr) {
 	s := NewSchema()
 	s.Description = res.Description()
@@ -187,13 +187,14 @@ func GenerateServiceDefinition(api *expr.APIExpr, res *expr.HTTPServiceExpr) {
 				} else {
 					identifier = ""
 				}
-				if targetSchema == nil {
+				switch {
+				case targetSchema == nil:
 					targetSchema = TypeSchemaWithPrefix(api, mt, a.Name())
-				} else if targetSchema.AnyOf == nil {
+				case targetSchema.AnyOf == nil:
 					firstSchema := targetSchema
 					targetSchema = NewSchema()
 					targetSchema.AnyOf = []*Schema{firstSchema, TypeSchemaWithPrefix(api, mt, a.Name())}
-				} else {
+				default:
 					targetSchema.AnyOf = append(targetSchema.AnyOf, TypeSchemaWithPrefix(api, mt, a.Name()))
 				}
 			}
@@ -230,7 +231,7 @@ func ResultTypeRef(api *expr.APIExpr, mt *expr.ResultTypeExpr, view string) stri
 
 // ResultTypeRefWithPrefix produces the JSON reference to the media type definition with
 // the given view and adds the provided prefix to the type name
-func ResultTypeRefWithPrefix(api *expr.APIExpr, mt *expr.ResultTypeExpr, view string, prefix string) string {
+func ResultTypeRefWithPrefix(api *expr.APIExpr, mt *expr.ResultTypeExpr, view, prefix string) string {
 	projected, err := expr.Project(mt, view)
 	if err != nil {
 		panic(fmt.Sprintf("failed to project media type %#v: %s", mt.Identifier, err)) // bug
@@ -247,7 +248,7 @@ func ResultTypeRefWithPrefix(api *expr.APIExpr, mt *expr.ResultTypeExpr, view st
 		if metaName != "" {
 			projected.TypeName = metaName
 		}
-		GenerateResultTypeDefinition(api, projected, "default")
+		GenerateResultTypeDefinition(api, projected, expr.DefaultView)
 	}
 	return fmt.Sprintf("#/definitions/%s", projected.TypeName)
 }
@@ -318,10 +319,13 @@ func TypeSchemaWithPrefix(api *expr.APIExpr, t expr.DataType, prefix string) *Sc
 		s.Type = Type(actual.Name())
 		switch actual.Kind() {
 		case expr.AnyKind:
-			s.Type = Type("string")
-			s.Format = "binary"
+			// A schema without a type matches any data type.
+			// See https://swagger.io/docs/specification/data-models/data-types/#any.
+			s.Type = Type("")
 		case expr.IntKind, expr.Int64Kind,
 			expr.UIntKind, expr.UInt64Kind:
+			// Use int64 format for IntKind and UIntKind because the OpenAPI
+			// generator produced int32 by default.
 			s.Type = Type("integer")
 			s.Format = "int64"
 		case expr.Int32Kind, expr.UInt32Kind:
@@ -344,7 +348,7 @@ func TypeSchemaWithPrefix(api *expr.APIExpr, t expr.DataType, prefix string) *Sc
 	case *expr.Object:
 		s.Type = Object
 		for _, nat := range *actual {
-			if !mustGenerate(nat.Attribute.Meta) {
+			if !MustGenerate(nat.Attribute.Meta) {
 				continue
 			}
 			prop := NewSchema()
@@ -483,6 +487,9 @@ func buildAttributeSchema(api *expr.APIExpr, s *Schema, at *expr.AttributeExpr) 
 	s.Description = at.Description
 	s.Example = at.Example(api.ExampleGenerator)
 	s.Extensions = ExtensionsFromExpr(at.Meta)
+	if ap := AdditionalPropertiesFromExpr(at.Meta); ap != nil {
+		s.AdditionalProperties = ap
+	}
 	initAttributeValidation(s, at)
 
 	return s
@@ -525,7 +532,14 @@ func initAttributeValidation(s *Schema, at *expr.AttributeExpr) {
 			s.MaxLength = val.MaxLength
 		}
 	}
-	s.Required = val.Required
+	for _, v := range val.Required {
+		if a := at.Find(v); a != nil {
+			if !MustGenerate(a.Meta) {
+				continue
+			}
+		}
+		s.Required = append(s.Required, v)
+	}
 }
 
 // toSchemaHrefs produces hrefs that replace the path wildcards with JSON
@@ -571,9 +585,9 @@ func buildResultTypeSchema(api *expr.APIExpr, mt *expr.ResultTypeExpr, view stri
 	buildAttributeSchema(api, s, projected.AttributeExpr)
 }
 
-// mustGenerate returns true if the meta indicates that a OpenAPI specification should be
+// MustGenerate returns true if the meta indicates that a OpenAPI specification should be
 // generated, false otherwise.
-func mustGenerate(meta expr.MetaExpr) bool {
+func MustGenerate(meta expr.MetaExpr) bool {
 	m, ok := meta.Last("openapi:generate")
 	if !ok {
 		m, ok = meta.Last("swagger:generate")
@@ -582,4 +596,13 @@ func mustGenerate(meta expr.MetaExpr) bool {
 		return false
 	}
 	return true
+}
+
+// AdditionalPropertiesFromExpr extracts the OpenAPI additionalProperties.
+func AdditionalPropertiesFromExpr(meta expr.MetaExpr) any {
+	m, ok := meta.Last("openapi:additionalProperties")
+	if ok && m == "false" {
+		return false
+	}
+	return nil
 }
