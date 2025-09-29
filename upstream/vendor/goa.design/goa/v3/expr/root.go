@@ -2,6 +2,8 @@ package expr
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 
 	"goa.design/goa/v3/eval"
@@ -11,6 +13,9 @@ import (
 // Root is the root object built by the DSL.
 var Root = new(RootExpr)
 
+// DefaultProtoc is the default command to be invoked for generating code from protobuf schemas.
+const DefaultProtoc = "protoc"
+
 type (
 	// RootExpr is the struct built by the DSL on process start.
 	RootExpr struct {
@@ -18,6 +23,8 @@ type (
 		API *APIExpr
 		// Services contains the list of services exposed by the API.
 		Services []*ServiceExpr
+		// Interceptors contains the list of interceptors.
+		Interceptors []*InterceptorExpr
 		// Errors contains the list of errors returned by all the API
 		// methods.
 		Errors []*ErrorExpr
@@ -92,25 +99,10 @@ func (r *RootExpr) WalkSets(walk eval.SetWalker) {
 	walk(methods)
 
 	// HTTP services and endpoints
-	httpsvcs := make(eval.ExpressionSet, len(r.API.HTTP.Services))
-	sort.SliceStable(r.API.HTTP.Services, func(i, j int) bool {
-		return r.API.HTTP.Services[j].ParentName == r.API.HTTP.Services[i].Name()
-	})
-	var httpepts eval.ExpressionSet
-	var httpsvrs eval.ExpressionSet
-	for i, svc := range r.API.HTTP.Services {
-		httpsvcs[i] = svc
-		for _, e := range svc.HTTPEndpoints {
-			httpepts = append(httpepts, e)
-		}
-		for _, s := range svc.FileServers {
-			httpsvrs = append(httpsvrs, s)
-		}
-	}
-	walk(eval.ExpressionSet{r.API.HTTP})
-	walk(httpsvcs)
-	walk(httpepts)
-	walk(httpsvrs)
+	r.walkHTTPServices(r.API.HTTP.Services, walk)
+
+	// JSON-RPC services and endpoints
+	r.walkHTTPServices(r.API.JSONRPC.Services, walk)
 
 	// GRPC services and endpoints
 	grpcsvcs := make(eval.ExpressionSet, len(r.API.GRPC.Services))
@@ -177,29 +169,6 @@ func (r *RootExpr) Error(name string) *ErrorExpr {
 	return nil
 }
 
-// HTTPService returns the HTTP service with the given name if any.
-func (r *RootExpr) HTTPService(name string) *HTTPServiceExpr {
-	for _, res := range r.API.HTTP.Services {
-		if res.Name() == name {
-			return res
-		}
-	}
-	return nil
-}
-
-// HTTPServiceFor creates a new or returns the existing HTTP service definition
-// for the given service.
-func (r *RootExpr) HTTPServiceFor(s *ServiceExpr) *HTTPServiceExpr {
-	if res := r.HTTPService(s.Name); res != nil {
-		return res
-	}
-	res := &HTTPServiceExpr{
-		ServiceExpr: s,
-	}
-	r.API.HTTP.Services = append(r.API.HTTP.Services, res)
-	return res
-}
-
 // EvalName is the name of the DSL.
 func (*RootExpr) EvalName() string {
 	return "design"
@@ -207,11 +176,43 @@ func (*RootExpr) EvalName() string {
 
 // Validate makes sure the root expression is valid for code generation.
 func (r *RootExpr) Validate() error {
-	var verr eval.ValidationErrors
-	if r.API == nil {
-		verr.Add(r, "Missing API declaration")
-	}
-	return &verr
+    var verr eval.ValidationErrors
+    if r.API == nil {
+        verr.Add(r, "Missing API declaration")
+    }
+    // Ensure user type Go type names are unique across the design. Duplicate
+    // user type names (e.g., via TypeName) can lead to conflicting generated
+    // code. The Type DSL checks for duplicate declared names; this check
+    // covers collisions introduced by renaming.
+    useen := make(map[string]struct{})
+    for _, ut := range r.Types {
+        name := ut.Name()
+        if _, ok := useen[name]; ok {
+            verr.Add(r, "type %#v defined twice", name)
+        } else {
+            useen[name] = struct{}{}
+        }
+    }
+    // Ensure result type Go type names are unique across declared result types
+    // (exclude generated collection/result types). Generated types (e.g.,
+    // CollectionOf) do not set the openapi:typename meta, whereas declared
+    // result types do (set when calling dsl.ResultType). This prevents
+    // collisions like two declared ResultType blocks both using TypeName("A"),
+    // while allowing declared types to coexist with generated collection types
+    // that may share a name like "XCollection".
+    seen := make(map[string]struct{})
+    for _, rt := range r.ResultTypes {
+        if _, declared := rt.Meta["openapi:typename"]; !declared {
+            continue // skip generated result types
+        }
+        name := rt.Name()
+        if _, ok := seen[name]; ok {
+            verr.Add(r, "result type %#v defined twice", name)
+        } else {
+            seen[name] = struct{}{}
+        }
+    }
+    return &verr
 }
 
 // Finalize finalizes the server expressions.
@@ -230,12 +231,33 @@ func (r *RootExpr) Finalize() {
 	}
 }
 
+// walkHTTPServices walks the HTTP services and endpoints.
+func (r *RootExpr) walkHTTPServices(svcs []*HTTPServiceExpr, walk eval.SetWalker) {
+	sort.SliceStable(svcs, func(i, j int) bool {
+		return svcs[j].ParentName == svcs[i].Name()
+	})
+	var httpepts eval.ExpressionSet
+	var httpsvrs eval.ExpressionSet
+	httpsvcs := make(eval.ExpressionSet, len(svcs))
+	for i, svc := range svcs {
+		httpsvcs[i] = svc
+		for _, e := range svc.HTTPEndpoints {
+			httpepts = append(httpepts, e)
+		}
+		for _, s := range svc.FileServers {
+			httpsvrs = append(httpsvrs, s)
+		}
+	}
+	walk(eval.ExpressionSet{r.API.HTTP})
+	walk(httpsvcs)
+	walk(httpepts)
+	walk(httpsvrs)
+}
+
 // Dup creates a new map from the given expression.
 func (m MetaExpr) Dup() MetaExpr {
 	d := make(MetaExpr, len(m))
-	for k, v := range m {
-		d[k] = v
-	}
+	maps.Copy(d, m)
 	return d
 }
 
@@ -247,13 +269,7 @@ func (m MetaExpr) Merge(src MetaExpr) {
 		if mvals, ok := m[k]; ok {
 			var found bool
 			for _, v := range vals {
-				found = false
-				for _, mv := range mvals {
-					if mv == v {
-						found = true
-						break
-					}
-				}
+				found = slices.Contains(mvals, v)
 				if !found {
 					mvals = append(mvals, v)
 				}
