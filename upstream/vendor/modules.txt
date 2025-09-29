@@ -546,8 +546,8 @@ github.com/spf13/viper/internal/features
 # github.com/stoewer/go-strcase v1.2.0
 ## explicit; go 1.11
 github.com/stoewer/go-strcase
-# github.com/stretchr/testify v1.8.4
-## explicit; go 1.20
+# github.com/stretchr/testify v1.9.0
+## explicit; go 1.17
 github.com/stretchr/testify/assert
 github.com/stretchr/testify/require
 # github.com/subosito/gotenv v1.6.0
@@ -656,8 +656,8 @@ github.com/tektoncd/plumbing/scripts
 # github.com/titanous/rocacheck v0.0.0-20171023193734-afe73141d399
 ## explicit
 github.com/titanous/rocacheck
-# github.com/vbatts/tar-split v0.11.3
-## explicit; go 1.15
+# github.com/vbatts/tar-split v0.12.1
+## explicit; go 1.17
 github.com/vbatts/tar-split/archive/tar
 # go.opencensus.io v0.24.0
 ## explicit; go 1.13
