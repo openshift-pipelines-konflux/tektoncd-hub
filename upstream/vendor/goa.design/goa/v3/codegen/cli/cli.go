@@ -34,6 +34,8 @@ type (
 		// PkgName is the service HTTP client package import name,
 		// e.g. "storagec".
 		PkgName string
+		// Interceptors contains the data for client interceptors if any.
+		Interceptors *InterceptorData
 	}
 
 	// SubcommandData contains the data needed to render a sub-command.
@@ -56,6 +58,16 @@ type (
 		Conversion string
 		// Example is a valid command invocation, starting with the command name.
 		Example string
+		// Interceptors contains the data for client interceptors if any apply to the endpoint method.
+		Interceptors *InterceptorData
+	}
+
+	// InterceptorData contains the data needed to generate interceptor code.
+	InterceptorData struct {
+		// VarName is the name of the interceptor variable.
+		VarName string
+		// PkgName is the package name containing the interceptor type.
+		PkgName string
 	}
 
 	// FlagData contains the data needed to render a command-line flag.
@@ -151,61 +163,71 @@ func BuildCommandData(data *service.Data) *CommandData {
 	if description == "" {
 		description = fmt.Sprintf("Make requests to the %q service", data.Name)
 	}
+
+	var interceptors *InterceptorData
+	if len(data.ClientInterceptors) > 0 {
+		interceptors = &InterceptorData{
+			VarName: "inter",
+			PkgName: data.PkgName,
+		}
+	}
+
 	return &CommandData{
-		Name:        codegen.KebabCase(data.Name),
-		VarName:     codegen.Goify(data.Name, false),
-		Description: description,
-		PkgName:     data.PkgName + "c",
+		Name:         codegen.KebabCase(data.Name),
+		VarName:      codegen.Goify(data.Name, false),
+		Description:  description,
+		PkgName:      data.PkgName + "c",
+		Interceptors: interceptors,
 	}
 }
 
 // BuildSubcommandData builds the data needed by CLI code generators to render
 // the CLI parsing of the service sub-command.
-func BuildSubcommandData(svcName string, m *service.MethodData, buildFunction *BuildFunctionData, flags []*FlagData) *SubcommandData {
-	var (
-		name        string
-		fullName    string
-		description string
+func BuildSubcommandData(data *service.Data, m *service.MethodData, buildFunction *BuildFunctionData, flags []*FlagData) *SubcommandData {
+	en := m.Name
+	name := codegen.KebabCase(en)
+	fullName := goifyTerms(data.Name, en)
+	description := m.Description
+	if description == "" {
+		description = fmt.Sprintf("Make request to the %q endpoint", m.Name)
+	}
 
-		conversion string
-	)
-	{
-		en := m.Name
-		name = codegen.KebabCase(en)
-		fullName = goifyTerms(svcName, en)
-		description = m.Description
-		if description == "" {
-			description = fmt.Sprintf("Make request to the %q endpoint", m.Name)
+	var conversion string
+	if m.Payload != "" && buildFunction == nil && len(flags) > 0 {
+		// No build function, just convert the arg to the body type
+		var convPre, convSuff string
+		target := "data"
+		if flagType(m.Payload) == "JSON" {
+			target = "val"
+			convPre = fmt.Sprintf("var val %s\n", m.Payload)
+			convSuff = "\ndata = val"
 		}
-
-		if m.Payload != "" && buildFunction == nil && len(flags) > 0 {
-			// No build function, just convert the arg to the body type
-			var convPre, convSuff string
-			target := "data"
+		conv, _, check := conversionCode(
+			"*"+flags[0].FullName+"Flag",
+			target,
+			m.Payload,
+			false,
+		)
+		conversion = convPre + conv + convSuff
+		if check {
+			conversion = "var err error\n" + conversion
+			conversion += "\nif err != nil {\n"
 			if flagType(m.Payload) == "JSON" {
-				target = "val"
-				convPre = fmt.Sprintf("var val %s\n", m.Payload)
-				convSuff = "\ndata = val"
+				conversion += fmt.Sprintf(`return nil, nil, fmt.Errorf("invalid JSON for %s, \nerror: %%s, \nexample of valid JSON:\n%%s", err, %q)`,
+					flags[0].FullName+"Flag", flags[0].Example)
+			} else {
+				conversion += fmt.Sprintf(`return nil, nil, fmt.Errorf("invalid value for %s, must be %s")`,
+					flags[0].FullName+"Flag", flags[0].Type)
 			}
-			conv, _, check := conversionCode(
-				"*"+flags[0].FullName+"Flag",
-				target,
-				m.Payload,
-				false,
-			)
-			conversion = convPre + conv + convSuff
-			if check {
-				conversion = "var err error\n" + conversion
-				conversion += "\nif err != nil {\n"
-				if flagType(m.Payload) == "JSON" {
-					conversion += fmt.Sprintf(`return nil, nil, fmt.Errorf("invalid JSON for %s, \nerror: %%s, \nexample of valid JSON:\n%%s", err, %q)`,
-						flags[0].FullName+"Flag", flags[0].Example)
-				} else {
-					conversion += fmt.Sprintf(`return nil, nil, fmt.Errorf("invalid value for %s, must be %s")`,
-						flags[0].FullName+"Flag", flags[0].Type)
-				}
-				conversion += "\n}"
-			}
+			conversion += "\n}"
+		}
+	}
+
+	var interceptors *InterceptorData
+	if len(m.ClientInterceptors) > 0 {
+		interceptors = &InterceptorData{
+			VarName: "inter",
+			PkgName: data.PkgName,
 		}
 	}
 	sub := &SubcommandData{
@@ -216,8 +238,9 @@ func BuildSubcommandData(svcName string, m *service.MethodData, buildFunction *B
 		MethodVarName: m.VarName,
 		BuildFunction: buildFunction,
 		Conversion:    conversion,
+		Interceptors:  interceptors,
 	}
-	generateExample(sub, svcName)
+	generateExample(sub, data.Name)
 
 	return sub
 }
@@ -239,7 +262,7 @@ func UsageCommands(data []*CommandData) *codegen.SectionTemplate {
 		usages[i] = fmt.Sprintf("%s %s%s%s", cmd.Name, lp, strings.Join(subs, "|"), rp)
 	}
 
-	return &codegen.SectionTemplate{Source: usageT, Data: usages}
+	return &codegen.SectionTemplate{Source: cliTemplates.Read(usageCommandsT), Data: usages}
 }
 
 // UsageExamples builds a section template that generates a help text showing
@@ -252,7 +275,7 @@ func UsageExamples(data []*CommandData) *codegen.SectionTemplate {
 		}
 	}
 
-	return &codegen.SectionTemplate{Source: exampleT, Data: examples}
+	return &codegen.SectionTemplate{Source: cliTemplates.Read(usageExamplesT), Data: examples}
 }
 
 // FlagsCode returns a string containing the code that parses the command-line
@@ -262,7 +285,7 @@ func UsageExamples(data []*CommandData) *codegen.SectionTemplate {
 func FlagsCode(data []*CommandData) string {
 	section := codegen.SectionTemplate{
 		Name:    "parse-endpoint-flags",
-		Source:  parseFlagsT,
+		Source:  cliTemplates.Read(parseFlagsT),
 		Data:    data,
 		FuncMap: map[string]any{"printDescription": printDescription},
 	}
@@ -280,7 +303,7 @@ func FlagsCode(data []*CommandData) string {
 func CommandUsage(data *CommandData) *codegen.SectionTemplate {
 	return &codegen.SectionTemplate{
 		Name:    "cli-command-usage",
-		Source:  commandUsageT,
+		Source:  cliTemplates.Read(commandUsageT),
 		Data:    data,
 		FuncMap: map[string]any{"printDescription": printDescription},
 	}
@@ -291,7 +314,7 @@ func CommandUsage(data *CommandData) *codegen.SectionTemplate {
 func PayloadBuilderSection(buildFunction *BuildFunctionData) *codegen.SectionTemplate {
 	return &codegen.SectionTemplate{
 		Name:   "cli-build-payload",
-		Source: buildPayloadT,
+		Source: cliTemplates.Read(buildPayloadT),
 		Data:   buildFunction,
 		FuncMap: map[string]any{
 			"fieldCode": fieldCode,
@@ -333,66 +356,64 @@ func FieldLoadCode(f *FlagData, argName, argTypeName, validate string, defaultVa
 		startIf string
 		endIf   string
 	)
-	{
-		if !f.Required {
-			startIf = fmt.Sprintf("if %s != \"\" {\n", f.FullName)
-			endIf = "\n}"
+	if !f.Required {
+		startIf = fmt.Sprintf("if %s != \"\" {\n", f.FullName)
+		endIf = "\n}"
+	}
+	if argTypeName == codegen.GoNativeTypeName(expr.String) {
+		ref := "&"
+		if f.Required || defaultValue != nil {
+			ref = ""
 		}
-		if argTypeName == codegen.GoNativeTypeName(expr.String) {
-			ref := "&"
-			if f.Required || defaultValue != nil {
-				ref = ""
-			}
-			code = argName + " = " + ref + f.FullName
-			declErr = validate != ""
-		} else {
-			var checkErr bool
-			code, declErr, checkErr = conversionCode(f.FullName, argName, argTypeName, !f.Required && defaultValue == nil)
-			if checkErr {
-				code += "\nif err != nil {\n"
-				nilVal := "nil"
-				if expr.IsPrimitive(payload) {
-					code += fmt.Sprintf("var zero %s\n", payloadRef)
-					nilVal = "zero"
-				}
-				if flagType(argTypeName) == "JSON" {
-					code += fmt.Sprintf(`return %s, fmt.Errorf("invalid JSON for %s, \nerror: %%s, \nexample of valid JSON:\n%%s", err, %q)`,
-						nilVal, argName, f.Example)
-				} else {
-					code += fmt.Sprintf(`return %s, fmt.Errorf("invalid value for %s, must be %s")`,
-						nilVal, argName, f.Type)
-				}
-				code += "\n}"
-			}
-		}
-		if validate != "" {
-			nilCheck := "if " + argName + " != nil {"
-			if strings.HasPrefix(validate, nilCheck) {
-				// hackety hack... the validation code is generated for the client and needs to
-				// account for the fact that the field could be nil in this case. We are reusing
-				// that code to validate a CLI flag which can never be nil.  Lint tools complain
-				// about that so remove the if statements. Ideally we'd have a better way to do
-				// this but that requires a lot of changes and the added complexity might not be
-				// worth it.
-				var lines []string
-				ls := strings.Split(validate, "\n")
-				for i := 1; i < len(ls)-1; i++ {
-					if ls[i+1] == nilCheck {
-						i++ // skip both closing brace on previous line and check
-						continue
-					}
-					lines = append(lines, ls[i])
-				}
-				validate = strings.Join(lines, "\n")
-			}
-			code += "\n" + validate + "\n"
+		code = argName + " = " + ref + f.FullName
+		declErr = validate != ""
+	} else {
+		var checkErr bool
+		code, declErr, checkErr = conversionCode(f.FullName, argName, argTypeName, !f.Required && defaultValue == nil)
+		if checkErr {
+			code += "\nif err != nil {\n"
 			nilVal := "nil"
 			if expr.IsPrimitive(payload) {
 				code += fmt.Sprintf("var zero %s\n", payloadRef)
 				nilVal = "zero"
 			}
-			code += fmt.Sprintf("if err != nil {\n\treturn %s, err\n}", nilVal)
+			if flagType(argTypeName) == "JSON" {
+				code += fmt.Sprintf(`return %s, fmt.Errorf("invalid JSON for %s, \nerror: %%s, \nexample of valid JSON:\n%%s", err, %q)`,
+					nilVal, argName, f.Example)
+			} else {
+				code += fmt.Sprintf(`return %s, fmt.Errorf("invalid value for %s, must be %s")`,
+					nilVal, argName, f.Type)
+			}
+			code += "\n}"
 		}
+	}
+	if validate != "" {
+		nilCheck := "if " + argName + " != nil {"
+		if strings.HasPrefix(validate, nilCheck) {
+			// hackety hack... the validation code is generated for the client and needs to
+			// account for the fact that the field could be nil in this case. We are reusing
+			// that code to validate a CLI flag which can never be nil.  Lint tools complain
+			// about that so remove the if statements. Ideally we'd have a better way to do
+			// this but that requires a lot of changes and the added complexity might not be
+			// worth it.
+			var lines []string
+			ls := strings.Split(validate, "\n")
+			for i := 1; i < len(ls)-1; i++ {
+				if ls[i+1] == nilCheck {
+					i++ // skip both closing brace on previous line and check
+					continue
+				}
+				lines = append(lines, ls[i])
+			}
+			validate = strings.Join(lines, "\n")
+		}
+		code += "\n" + validate + "\n"
+		nilVal := "nil"
+		if expr.IsPrimitive(payload) {
+			code += fmt.Sprintf("var zero %s\n", payloadRef)
+			nilVal = "zero"
+		}
+		code += fmt.Sprintf("if err != nil {\n\treturn %s, err\n}", nilVal)
 	}
 	return fmt.Sprintf("%s%s%s", startIf, code, endIf), declErr
 }
@@ -538,7 +559,7 @@ func conversionCode(from, to, typeName string, pointer bool) (string, bool, bool
 		if pointer {
 			ref = "&"
 		}
-		parse = parse + fmt.Sprintf("\n%s = %s%s", to, ref, target)
+		parse += fmt.Sprintf("\n%s = %s%s", to, ref, target)
 	}
 	return parse, declErr, checkErr
 }
@@ -585,165 +606,3 @@ func fieldCode(init *PayloadInitData) string {
 	return c
 }
 
-// input: []string
-const usageT = `// UsageCommands returns the set of commands and sub-commands using the format
-//
-//    command (subcommand1|subcommand2|...)
-//
-func UsageCommands() string {
-	return ` + "`" + `{{ range . }}{{ . }}
-{{ end }}` + "`" + `
-}
-`
-
-// input: []string
-const exampleT = `// UsageExamples produces an example of a valid invocation of the CLI tool.
-func UsageExamples() string {
-	return {{ range . }}os.Args[0] + ` + "`" + ` {{ . }}` + "`" + ` + "\n" +
-	{{ end }}""
-}
-`
-
-// input: []commandData
-const parseFlagsT = `var (
-		{{- range . }}
-		{{ .VarName }}Flags = flag.NewFlagSet("{{ .Name }}", flag.ContinueOnError)
-		{{ range .Subcommands }}
-		{{ .FullName }}Flags = flag.NewFlagSet("{{ .Name }}", flag.ExitOnError)
-		{{- $sub := . }}
-		{{- range .Flags }}
-		{{ .FullName }}Flag = {{ $sub.FullName }}Flags.String("{{ .Name }}", "{{ if .Default }}{{ .Default }}{{ else if .Required }}REQUIRED{{ end }}", {{ printf "%q" .Description }})
-		{{- end }}
-		{{ end }}
-		{{- end }}
-	)
-	{{ range . -}}
-	{{ $cmd := . -}}
-	{{ .VarName }}Flags.Usage = {{ .VarName }}Usage
-	{{ range .Subcommands -}}
-	{{ .FullName }}Flags.Usage = {{ .FullName }}Usage
-	{{ end }}
-	{{ end }}
-	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
-		return nil, nil, err
-	}
-
-	if flag.NArg() < 2 { // two non flag args are required: SERVICE and ENDPOINT (aka COMMAND)
-		return nil, nil, fmt.Errorf("not enough arguments")
-	}
-
-	var (
-		svcn string
-		svcf *flag.FlagSet
-	)
-	{
-		svcn = flag.Arg(0)
-		switch svcn {
-	{{- range . }}
-		case "{{ .Name }}":
-			svcf = {{ .VarName }}Flags
-	{{- end }}
-		default:
-			return nil, nil, fmt.Errorf("unknown service %q", svcn)
-		}
-	}
-	if err := svcf.Parse(flag.Args()[1:]); err != nil {
-		return nil, nil, err
-	}
-
-	var (
-		epn string
-		epf *flag.FlagSet
-	)
-	{
-		epn = svcf.Arg(0)
-		switch svcn {
-	{{- range . }}
-		case "{{ .Name }}":
-			switch epn {
-		{{- range .Subcommands }}
-			case "{{ .Name }}":
-				epf = {{ .FullName }}Flags
-		{{ end }}
-			}
-	{{ end }}
-		}
-	}
-	if epf == nil {
-		return nil, nil, fmt.Errorf("unknown %q endpoint %q", svcn, epn)
-	}
-
-	// Parse endpoint flags if any
-	if svcf.NArg() > 1 {
-		if err := epf.Parse(svcf.Args()[1:]); err != nil {
-			return nil, nil, err
-		}
-	}
-`
-
-// input: commandData
-const commandUsageT = `{{ printf "%sUsage displays the usage of the %s command and its subcommands." .Name .Name | comment }}
-func {{ .VarName }}Usage() {
-	fmt.Fprintf(os.Stderr, ` + "`" + `{{ printDescription .Description }}
-Usage:
-    %[1]s [globalflags] {{ .Name }} COMMAND [flags]
-
-COMMAND:
-    {{- range .Subcommands }}
-    {{ .Name }}: {{ printDescription .Description }}
-    {{- end }}
-
-Additional help:
-    %[1]s {{ .Name }} COMMAND --help
-` + "`" + `, os.Args[0])
-}
-
-{{- range .Subcommands }}
-func {{ .FullName }}Usage() {
-	fmt.Fprintf(os.Stderr, ` + "`" + `%[1]s [flags] {{ $.Name }} {{ .Name }}{{range .Flags }} -{{ .Name }} {{ .Type }}{{ end }}
-
-{{ printDescription .Description}}
-	{{- range .Flags }}
-    -{{ .Name }} {{ .Type }}: {{ .Description }}
-	{{- end }}
-
-Example:
-    %[1]s {{ .Example }}
-` + "`" + `, os.Args[0])
-}
-{{ end }}
-`
-
-// input: buildFunctionData
-const buildPayloadT = `{{ printf "%s builds the payload for the %s %s endpoint from CLI flags." .Name .ServiceName .MethodName | comment }}
-func {{ .Name }}({{ range .FormalParams }}{{ . }} string, {{ end }}) ({{ .ResultType }}, error) {
-{{- if .CheckErr }}
-	var err error
-{{- end }}
-{{- range .Fields }}
-	{{- if .VarName }}
-		var {{ .VarName }} {{ .TypeRef }}
-		{
-			{{ .Init }}
-		}
-	{{- end }}
-{{- end }}
-{{- with .PayloadInit }}
-	{{- if .Code }}
-		{{ .Code }}
-		{{- if .ReturnTypeAttribute }}
-			res := &{{ .ReturnTypeName }}{
-				{{ .ReturnTypeAttribute }}: {{ if .ReturnTypeAttributePointer }}&{{ end }}v,
-			}
-		{{- end }}
-	{{- end }}
-	{{- if .ReturnIsStruct }}
-		{{- if not .Code }}
-		{{ if .ReturnTypeAttribute }}res{{ else }}v{{ end }} := &{{ .ReturnTypeName }}{}
-		{{- end }}
-		{{ fieldCode . }}
-	{{- end }}
-	return {{ if .ReturnTypeAttribute }}res{{ else }}v{{ end }}, nil
-{{- end }}
-}
-`
