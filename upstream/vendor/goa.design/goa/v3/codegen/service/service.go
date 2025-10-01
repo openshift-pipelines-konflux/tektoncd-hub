@@ -13,15 +13,14 @@ import (
 // indexing user type names by custom path as defined by the "struct:pkg:path"
 // metadata. The map is built over each invocation of Files to avoid duplicate
 // type definitions.
-func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]string) []*codegen.File {
-	svc := Services.Get(service.Name)
-	svc.initUserTypeImports(genpkg)
+func Files(genpkg string, service *expr.ServiceExpr, services *ServicesData, userTypePkgs map[string][]string) []*codegen.File {
+	svc := services.Get(service.Name)
 	svcName := svc.PathName
 	svcPath := filepath.Join(codegen.Gendir, svcName, "service.go")
 	seen := make(map[string]struct{})
 	typeDefSections := make(map[string]map[string]*codegen.SectionTemplate)
 	typesByPath := make(map[string][]string)
-	var svcSections []*codegen.SectionTemplate
+	svcSections := make([]*codegen.SectionTemplate, 0, 10)
 
 	addTypeDefSection := func(path, name string, section *codegen.SectionTemplate) {
 		if typeDefSections[path] == nil {
@@ -39,7 +38,7 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 			if _, ok := seen[m.Payload]; !ok {
 				addTypeDefSection(payloadPath, m.Payload, &codegen.SectionTemplate{
 					Name:   "service-payload",
-					Source: payloadT,
+					Source: serviceTemplates.Read(payloadT),
 					Data:   m,
 				})
 			}
@@ -47,8 +46,8 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 		if m.StreamingPayloadDef != "" {
 			if _, ok := seen[m.StreamingPayload]; !ok {
 				addTypeDefSection(payloadPath, m.StreamingPayload, &codegen.SectionTemplate{
-					Name:   "service-streamig-payload",
-					Source: streamingPayloadT,
+					Name:   "service-streaming-payload",
+					Source: serviceTemplates.Read(streamingPayloadT),
 					Data:   m,
 				})
 			}
@@ -57,8 +56,22 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 			if _, ok := seen[m.Result]; !ok {
 				addTypeDefSection(resultPath, m.Result, &codegen.SectionTemplate{
 					Name:   "service-result",
-					Source: resultT,
+					Source: serviceTemplates.Read(resultT),
 					Data:   m,
+				})
+			}
+		}
+		// Generate streaming result type if different from result
+		if m.StreamingResultDef != "" && m.StreamingResult != m.Result {
+			if _, ok := seen[m.StreamingResult]; !ok {
+				addTypeDefSection(resultPath, m.StreamingResult, &codegen.SectionTemplate{
+					Name:   "service-streaming-result",
+					Source: serviceTemplates.Read(resultT),
+					Data: map[string]any{
+						"Result":     m.StreamingResult,
+						"ResultDef":  m.StreamingResultDef,
+						"ResultDesc": m.StreamingResultDesc,
+					},
 				})
 			}
 		}
@@ -67,7 +80,7 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 		if _, ok := seen[ut.VarName]; !ok {
 			addTypeDefSection(pathWithDefault(ut.Loc, svcPath), ut.VarName, &codegen.SectionTemplate{
 				Name:   "service-user-type",
-				Source: userTypeT,
+				Source: serviceTemplates.Read(userTypeT),
 				Data:   ut,
 			})
 		}
@@ -84,7 +97,7 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 			if _, ok := seen[et.Name]; !ok {
 				addTypeDefSection(pathWithDefault(et.Loc, svcPath), et.Name, &codegen.SectionTemplate{
 					Name:   "error-user-type",
-					Source: userTypeT,
+					Source: serviceTemplates.Read(userTypeT),
 					Data:   et,
 				})
 			}
@@ -95,7 +108,7 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 	for _, m := range svc.unionValueMethods {
 		addTypeDefSection(pathWithDefault(m.Loc, svcPath), "~"+m.TypeRef+"."+m.Name, &codegen.SectionTemplate{
 			Name:   "service-union-value-method",
-			Source: unionValueMethodT,
+			Source: serviceTemplates.Read(unionValueMethodT),
 			Data:   m,
 		})
 	}
@@ -107,7 +120,7 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 		key := "|" + et.Name
 		addTypeDefSection(pathWithDefault(et.Loc, svcPath), key, &codegen.SectionTemplate{
 			Name:    "service-error",
-			Source:  errorT,
+			Source:  serviceTemplates.Read(errorT),
 			FuncMap: map[string]any{"errorName": errorName},
 			Data:    et,
 		})
@@ -115,23 +128,16 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 	for _, er := range svc.errorInits {
 		svcSections = append(svcSections, &codegen.SectionTemplate{
 			Name:   "error-init-func",
-			Source: errorInitT,
+			Source: serviceTemplates.Read(errorInitT),
 			Data:   er,
 		})
 	}
 
 	// transform result type functions
 	for _, t := range svc.viewedResultTypes {
-		svcSections = append(svcSections, &codegen.SectionTemplate{
-			Name:   "viewed-result-type-to-service-result-type",
-			Source: typeInitT,
-			Data:   t.ResultInit,
-		})
-		svcSections = append(svcSections, &codegen.SectionTemplate{
-			Name:   "service-result-type-to-viewed-result-type",
-			Source: typeInitT,
-			Data:   t.Init,
-		})
+		svcSections = append(svcSections,
+			&codegen.SectionTemplate{Name: "viewed-result-type-to-service-result-type", Source: serviceTemplates.Read(typeInitT), Data: t.ResultInit},
+			&codegen.SectionTemplate{Name: "service-result-type-to-viewed-result-type", Source: serviceTemplates.Read(typeInitT), Data: t.Init})
 	}
 	var projh []*codegen.TransformFunctionData
 	for _, t := range svc.projectedTypes {
@@ -139,7 +145,7 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 			projh = codegen.AppendHelpers(projh, i.Helpers)
 			svcSections = append(svcSections, &codegen.SectionTemplate{
 				Name:   "projected-type-to-service-type",
-				Source: typeInitT,
+				Source: serviceTemplates.Read(typeInitT),
 				Data:   i,
 			})
 		}
@@ -147,7 +153,7 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 			projh = codegen.AppendHelpers(projh, i.Helpers)
 			svcSections = append(svcSections, &codegen.SectionTemplate{
 				Name:   "service-type-to-projected-type",
-				Source: typeInitT,
+				Source: serviceTemplates.Read(typeInitT),
 				Data:   i,
 			})
 		}
@@ -156,7 +162,7 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 	for _, h := range projh {
 		svcSections = append(svcSections, &codegen.SectionTemplate{
 			Name:   "transform-helpers",
-			Source: transformHelperT,
+			Source: serviceTemplates.Read(transformHelperT),
 			Data:   h,
 		})
 	}
@@ -168,13 +174,17 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 		codegen.GoaImport("security"),
 		codegen.NewImport(svc.ViewsPkg, genpkg+"/"+svcName+"/views"),
 	}
-	imports = append(imports, svc.UserTypeImports...)
 	header := codegen.Header(service.Name+" service", svc.PkgName, imports)
 	def := &codegen.SectionTemplate{
-		Name:    "service",
-		Source:  serviceT,
-		Data:    svc,
-		FuncMap: map[string]any{"streamInterfaceFor": streamInterfaceFor},
+		Name:   "service",
+		Source: serviceTemplates.Read(serviceT),
+		Data:   svc,
+		FuncMap: map[string]any{
+			"hasJSONRPCStreaming": hasJSONRPCStreaming,
+			"isJSONRPCWebSocket":  func(sd *Data) bool { return hasJSONRPCStreaming(sd) && !isJSONRPCSSE(services, service) },
+			"streamInterfaceFor":  streamInterfaceFor,
+			"dedupeByResult":      dedupeByResult,
+		},
 	}
 
 	// service.go
@@ -194,6 +204,9 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 		sections = append(sections, svcSections...)
 	}
 	files := []*codegen.File{{Path: svcPath, SectionTemplates: sections}}
+
+	// service and client interceptors
+	files = append(files, InterceptorsFiles(genpkg, service, services)...)
 
 	// user types
 	paths := make([]string, len(typeDefSections))
@@ -236,21 +249,76 @@ func Files(genpkg string, service *expr.ServiceExpr, userTypePkgs map[string][]s
 	return files
 }
 
+// dedupeByResult returns a slice of methods where only a single representative
+// per unique ResultRef is kept (first occurrence wins). Methods without a
+// ResultRef are ignored.
+func dedupeByResult(ms []*MethodData) []*MethodData {
+	seen := make(map[string]struct{})
+	out := make([]*MethodData, 0, len(ms))
+	for _, m := range ms {
+		key := m.Result
+		if key == "" {
+			key = m.StreamingResult
+		}
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, m)
+	}
+	return out
+}
+
 // AddServiceDataMetaTypeImports Adds all imports defined by struct:field:type from the service expr and the service data
-func AddServiceDataMetaTypeImports(header *codegen.SectionTemplate, serviceE *expr.ServiceExpr) {
-	codegen.AddServiceMetaTypeImports(header, serviceE)
-	svc := Services.Get(serviceE.Name)
-	for _, ut := range svc.userTypes {
+func AddServiceDataMetaTypeImports(header *codegen.SectionTemplate, svcExpr *expr.ServiceExpr, svcData *Data) {
+	codegen.AddServiceMetaTypeImports(header, svcExpr)
+	for _, ut := range svcData.userTypes {
 		codegen.AddImport(header, codegen.GetMetaTypeImports(ut.Type.Attribute())...)
 	}
-	for _, et := range svc.errorTypes {
+	for _, et := range svcData.errorTypes {
 		codegen.AddImport(header, codegen.GetMetaTypeImports(et.Type.Attribute())...)
 	}
-	for _, t := range svc.viewedResultTypes {
+	for _, t := range svcData.viewedResultTypes {
 		codegen.AddImport(header, codegen.GetMetaTypeImports(t.Type.Attribute())...)
 	}
-	for _, t := range svc.projectedTypes {
+	for _, t := range svcData.projectedTypes {
 		codegen.AddImport(header, codegen.GetMetaTypeImports(t.Type.Attribute())...)
+	}
+}
+
+// AddUserTypeImports sets the import paths for the user types defined in the
+// service.  User types may be declared in multiple packages when defined with
+// the Meta key "struct:pkg:path".
+func AddUserTypeImports(genpkg string, header *codegen.SectionTemplate, d *Data) {
+	importsByPath := make(map[string]*codegen.ImportSpec)
+
+	initLoc := func(loc *codegen.Location) {
+		if loc == nil {
+			return
+		}
+		importsByPath[loc.FilePath] = &codegen.ImportSpec{Name: loc.PackageName(), Path: genpkg + "/" + loc.RelImportPath}
+	}
+
+	for _, m := range d.Methods {
+		initLoc(m.PayloadLoc)
+		initLoc(m.ResultLoc)
+		for _, l := range m.ErrorLocs {
+			initLoc(l)
+		}
+		for _, ut := range d.userTypes {
+			initLoc(ut.Loc)
+		}
+		for _, et := range d.errorTypes {
+			initLoc(et.Loc)
+		}
+	}
+
+	for _, imp := range importsByPath { // Order does not matter, imports are sorted during formatting.
+		codegen.AddImport(header, imp)
+		d.UserTypeImports = append(d.UserTypeImports, imp)
 	}
 }
 
@@ -272,13 +340,47 @@ func errorName(et *UserTypeData) string {
 	return fmt.Sprintf("%q", et.Name)
 }
 
+// hasJSONRPCStreaming returns true if the service has a JSON-RPC streaming
+// endpoint (WebSocket or SSE).
+func hasJSONRPCStreaming(sd *Data) bool {
+	for _, m := range sd.Methods {
+		if m.IsJSONRPC && m.ServerStream != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// isJSONRPCSSE returns true if the service uses SSE for JSON-RPC streaming.
+// This requires checking the HTTP endpoints in the root expression.
+func isJSONRPCSSE(sd *ServicesData, svc *expr.ServiceExpr) bool {
+	// Check if service has JSON-RPC
+	httpSvc := sd.Root.API.JSONRPC.HTTPExpr.Service(svc.Name)
+	if httpSvc == nil {
+		return false
+	}
+
+	// Check if any JSON-RPC streaming endpoint uses SSE
+	for _, e := range httpSvc.HTTPEndpoints {
+		if e.MethodExpr.IsStreaming() && e.IsJSONRPC() && e.SSE != nil {
+			return true
+		}
+	}
+
+	return false
+}
+
 // streamInterfaceFor builds the data to generate the client and server stream
 // interfaces for the given endpoint.
 func streamInterfaceFor(typ string, m *MethodData, stream *StreamData) map[string]any {
 	return map[string]any{
-		"Type":     typ,
-		"Endpoint": m.Name,
-		"Stream":   stream,
+		"Type":               typ,
+		"Endpoint":           m.Name,
+		"Stream":             stream,
+		"MethodVarName":      m.VarName,
+		"IsJSONRPC":          m.IsJSONRPC,
+		"IsJSONRPCSSE":       m.IsJSONRPCSSE && typ == "server",
+		"IsJSONRPCWebSocket": m.IsJSONRPCWebSocket,
 		// If a view is explicitly set (ViewName is not empty) in the Result
 		// expression, we can use that view to render the result type instead
 		// of iterating through the list of views defined in the result type.
@@ -292,135 +394,3 @@ func pathWithDefault(loc *codegen.Location, def string) string {
 	}
 	return loc.FilePath
 }
-
-// serviceT is the template used to write an service definition.
-const serviceT = `
-{{ comment .Description }}
-type Service interface {
-{{- range .Methods }}
-	{{ comment .Description }}
-	{{- if .ViewedResult }}
-		{{- if not .ViewedResult.ViewName }}
-			{{ comment "The \"view\" return value must have one of the following views" }}
-			{{- range .ViewedResult.Views }}
-				{{- if .Description }}
-					{{ printf "//	- %q: %s" .Name .Description }}
-				{{- else }}
-					{{ printf "//	- %q" .Name }}
-				{{- end }}
-			{{- end }}
-		{{- end }}
-	{{- end }}
-	{{- if .ServerStream }}
-		{{ .VarName }}(context.Context{{ if .Payload }}, {{ .PayloadRef }}{{ end }}, {{ .ServerStream.Interface }}) (err error)
-	{{- else }}
-		{{ .VarName }}(context.Context{{ if .Payload }}, {{ .PayloadRef }}{{ end }}{{ if .SkipRequestBodyEncodeDecode }}, io.ReadCloser{{ end }}) ({{ if .Result }}res {{ .ResultRef }}, {{ end }}{{ if .SkipResponseBodyEncodeDecode }}body io.ReadCloser, {{ end }}{{ if .Result }}{{ if .ViewedResult }}{{ if not .ViewedResult.ViewName }}view string, {{ end }}{{ end }}{{ end }}err error)
-	{{- end }}
-{{- end }}
-}
-
-{{- if .Schemes }}
-// Auther defines the authorization functions to be implemented by the service.
-type Auther interface {
-	{{- range .Schemes }}
-	{{ printf "%sAuth implements the authorization logic for the %s security scheme." .Type .Type | comment }}
-	{{ .Type }}Auth(ctx context.Context, {{ if eq .Type "Basic" }}user, pass{{ else if eq .Type "APIKey" }}key{{ else }}token{{ end }} string, schema *security.{{ .Type }}Scheme) (context.Context, error)
-	{{- end }}
-}
-{{- end }}
-
-// APIName is the name of the API as defined in the design.
-const APIName = {{ printf "%q" .APIName }}
-
-// APIVersion is the version of the API as defined in the design.
-const APIVersion = {{ printf "%q" .APIVersion }}
-
-// ServiceName is the name of the service as defined in the design. This is the
-// same value that is set in the endpoint request contexts under the ServiceKey
-// key.
-const ServiceName = {{ printf "%q" .Name }}
-
-// MethodNames lists the service method names as defined in the design. These
-// are the same values that are set in the endpoint request contexts under the
-// MethodKey key.
-var MethodNames = [{{ len .Methods }}]string{ {{ range .Methods }}{{ printf "%q" .Name }}, {{ end }} }
-{{- range .Methods }}
-	{{- if .ServerStream }}
-		{{ template "stream_interface" (streamInterfaceFor "server" . .ServerStream) }}
-		{{ template "stream_interface" (streamInterfaceFor "client" . .ClientStream) }}
-	{{- end }}
-{{- end }}
-
-{{- define "stream_interface" }}
-{{ printf "%s is the interface a %q endpoint %s stream must satisfy." .Stream.Interface .Endpoint .Type | comment }}
-type {{ .Stream.Interface }} interface {
-	{{- if .Stream.SendTypeRef }}
-		{{ comment .Stream.SendDesc }}
-		{{ .Stream.SendName }}({{ .Stream.SendTypeRef }}) error
-	{{- end }}
-	{{- if .Stream.RecvTypeRef }}
-		{{ comment .Stream.RecvDesc }}
-		{{ .Stream.RecvName }}() ({{ .Stream.RecvTypeRef }}, error)
-	{{- end }}
-	{{- if .Stream.MustClose }}
-		{{ comment "Close closes the stream." }}
-		Close() error
-	{{- end }}
-	{{- if and .IsViewedResult (eq .Type "server") }}
-		{{ comment "SetView sets the view used to render the result before streaming." }}
-		SetView(view string)
-	{{- end }}
-}
-{{- end }}
-`
-
-const payloadT = `{{ comment .PayloadDesc }}
-type {{ .Payload }} {{ .PayloadDef }}
-`
-
-const streamingPayloadT = `{{ comment .StreamingPayloadDesc }}
-type {{ .StreamingPayload }} {{ .StreamingPayloadDef }}
-`
-
-const resultT = `{{ comment .ResultDesc }}
-type {{ .Result }} {{ .ResultDef }}
-`
-
-const userTypeT = `{{ comment .Description }}
-type {{ .VarName }} {{ .Def }}
-`
-
-const errorT = `// Error returns an error description.
-func (e {{ .Ref }}) Error() string {
-	return {{ printf "%q" .Description }}
-}
-
-// ErrorName returns {{ printf "%q" .Name }}.
-//
-// Deprecated: Use GoaErrorName - https://github.com/goadesign/goa/issues/3105
-func (e {{ .Ref }}) ErrorName() string {
-	return e.GoaErrorName()
-}
-
-// GoaErrorName returns {{ printf "%q" .Name }}.
-func (e {{ .Ref }}) GoaErrorName() string {
-	return {{ errorName . }}
-}
-`
-
-const unionValueMethodT = `func ({{ .TypeRef }}) {{ .Name }}() {}
-`
-
-// input: map[string]{"Type": TypeData, "Error": ErrorData}
-const errorInitT = `{{ printf "%s builds a %s from an error." .Name .TypeName |  comment }}
-func {{ .Name }}(err error) {{ .TypeRef }} {
-	return goa.NewServiceError(err, {{ printf "%q" .ErrName }}, {{ printf "%v" .Timeout }}, {{ printf "%v" .Temporary}}, {{ printf "%v" .Fault}})
-}
-`
-
-// input: InitData
-const typeInitT = `{{ comment .Description }}
-func {{ .Name }}({{ range .Args }}{{ .Name }} {{ .Ref }}, {{ end }}) {{ .ReturnTypeRef }} {
-	{{ .Code }}
-}
-`

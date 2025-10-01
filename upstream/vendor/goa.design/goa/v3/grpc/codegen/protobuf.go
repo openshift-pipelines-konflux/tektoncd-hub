@@ -3,6 +3,7 @@ package codegen
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -199,6 +200,9 @@ func protoBufFullMessageName(att *expr.AttributeExpr, pkg string, s *codegen.Nam
 	switch actual := att.Type.(type) {
 	case expr.UserType, *expr.Union:
 		n := s.HashedUnique(actual, protoBufify(actual.Name(), true, true), "")
+		if name := att.Meta["struct:name:proto"]; len(name) > 0 {
+			n = name[0]
+		}
 		if pkg == "" {
 			return n
 		}
@@ -210,7 +214,7 @@ func protoBufFullMessageName(att *expr.AttributeExpr, pkg string, s *codegen.Nam
 	}
 }
 
-// protoBufGoFullTypeName returns the protocol buffer type name for the given
+// protoBufGoTypeName returns the protocol buffer type name for the given
 // attribute generated after compiling the proto file (in *.pb.go).
 func protoBufGoTypeName(att *expr.AttributeExpr, s *codegen.NameScope) string {
 	return protoBufGoFullTypeName(att, "", s)
@@ -266,9 +270,19 @@ func protoBufMessageDef(att *expr.AttributeExpr, sd *ServiceData) string {
 	case *expr.Map:
 		return fmt.Sprintf("map<%s, %s>", protoType(actual.KeyType, sd), protoType(actual.ElemType, sd))
 	case *expr.Union:
-		def := "\toneof " + codegen.SnakeCase(protoBufify(actual.Name(), false, false)) + " {"
+		// Compute oneof name and ensure it does not collide with any of the member field names
+		oneofName := codegen.SnakeCase(protoBufify(actual.Name(), false, false))
+		var fieldNames []string
 		for _, nat := range actual.Values {
 			fn := codegen.SnakeCase(protoBufify(nat.Name, false, false))
+			fieldNames = append(fieldNames, fn)
+		}
+		for slices.Contains(fieldNames, oneofName) {
+			oneofName += "_oneof"
+		}
+		def := "\toneof " + oneofName + " {"
+		for i, nat := range actual.Values {
+			fn := fieldNames[i]
 			fnum := rpcTag(nat.Attribute)
 			var typ string
 			if prim := getPrimitive(nat.Attribute); prim != nil {
@@ -426,6 +440,8 @@ func protoNativeType(t expr.DataType) string {
 		return "string"
 	case expr.BytesKind:
 		return "bytes"
+	case expr.AnyKind:
+		return "google.protobuf.Any"
 	default:
 		panic(fmt.Sprintf("cannot compute native protocol buffer type for %T", t)) // bug
 	}
@@ -458,6 +474,8 @@ func protoBufNativeGoTypeName(t expr.DataType) string {
 		return "string"
 	case expr.BytesKind:
 		return "[]byte"
+	case expr.AnyKind:
+		return "*anypb.Any"
 	default:
 		panic(fmt.Sprintf("cannot compute native protocol buffer type for %T %v", t, t)) // bug
 	}

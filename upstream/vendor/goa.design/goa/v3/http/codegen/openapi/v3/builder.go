@@ -2,6 +2,7 @@ package openapiv3
 
 import (
 	"fmt"
+	"maps"
 	"regexp"
 	"sort"
 	"strconv"
@@ -39,7 +40,7 @@ func New(root *expr.RootExpr) *OpenAPI {
 	}
 
 	var (
-		bodies, types = buildBodyTypes(root.API)
+		bodies, types = buildBodyTypes(root.API, root.Types, root.ResultTypes)
 
 		info     = buildInfo(root.API)
 		comps    = buildComponents(root, types)
@@ -119,25 +120,23 @@ func buildComponents(root *expr.RootExpr, types map[string]*openapi.Schema) *Com
 func buildPaths(h *expr.HTTPExpr, bodies map[string]map[string]*EndpointBodies, api *expr.APIExpr) map[string]*PathItem {
 	var paths = make(map[string]*PathItem)
 	for _, svc := range h.Services {
-		if !mustGenerate(svc.Meta) || !mustGenerate(svc.ServiceExpr.Meta) {
+		if !openapi.MustGenerate(svc.Meta) || !openapi.MustGenerate(svc.ServiceExpr.Meta) {
 			continue
 		}
-
 		exts := openapi.ExtensionsFromExpr(svc.Meta)
 		sbod := bodies[svc.Name()]
 
 		// endpoints
 		for _, e := range svc.HTTPEndpoints {
-			if !mustGenerate(e.Meta) || !mustGenerate(e.MethodExpr.Meta) {
+			if !openapi.MustGenerate(e.Meta) || !openapi.MustGenerate(e.MethodExpr.Meta) {
 				continue
 			}
-
 			for _, r := range e.Routes {
 				for _, key := range r.FullPaths() {
 					// Remove any wildcards that is defined in path as a workaround to
 					// https://github.com/OAI/OpenAPI-Specification/issues/291
 					key = expr.HTTPWildcardRegex.ReplaceAllString(key, "/{$1}")
-					operation := buildOperation(key, r, sbod[e.Name()], api.ExampleGenerator)
+					operation := buildOperation(key, r, sbod[e.Name()], api.ExampleGenerator, api.Meta)
 					path, ok := paths[key]
 					if !ok {
 						path = new(PathItem)
@@ -162,9 +161,7 @@ func buildPaths(h *expr.HTTPExpr, bodies map[string]map[string]*EndpointBodies, 
 					path.Extensions = openapi.ExtensionsFromExpr(r.Endpoint.Meta)
 					if len(exts) > 0 {
 						path.Extensions = make(map[string]any)
-						for k, v := range exts {
-							path.Extensions[k] = v
-						}
+						maps.Copy(path.Extensions, exts)
 					}
 				}
 			}
@@ -172,7 +169,7 @@ func buildPaths(h *expr.HTTPExpr, bodies map[string]map[string]*EndpointBodies, 
 
 		// file servers
 		for _, f := range svc.FileServers {
-			if !mustGenerate(f.Meta) || !mustGenerate(f.Service.Meta) {
+			if !openapi.MustGenerate(f.Meta) || !openapi.MustGenerate(f.Service.Meta) {
 				continue
 			}
 
@@ -191,7 +188,7 @@ func buildPaths(h *expr.HTTPExpr, bodies map[string]map[string]*EndpointBodies, 
 }
 
 // buildOperation builds the OpenAPI Operation object for the given path.
-func buildOperation(key string, r *expr.RouteExpr, bodies *EndpointBodies, rand *expr.ExampleGenerator) *Operation {
+func buildOperation(key string, r *expr.RouteExpr, bodies *EndpointBodies, rand *expr.ExampleGenerator, meta expr.MetaExpr) *Operation {
 	e := r.Endpoint
 	m := e.MethodExpr
 	svc := e.Service
@@ -210,12 +207,11 @@ func buildOperation(key string, r *expr.RouteExpr, bodies *EndpointBodies, rand 
 		}
 	}
 
-	{
-		summary = fmt.Sprintf("%s %s", e.Name(), svc.Name())
-		setSummary(expr.Root.API.Meta)
-		setSummary(r.Endpoint.Meta)
-		setSummary(m.Meta)
-	}
+	summary = fmt.Sprintf("%s %s", e.Name(), svc.Name())
+	setSummary(meta)
+	setSummary(svc.ServiceExpr.Meta)
+	setSummary(e.Meta)
+	setSummary(m.Meta)
 
 	// OpenAPI operationId
 	var operationIDFormat string
@@ -227,13 +223,11 @@ func buildOperation(key string, r *expr.RouteExpr, bodies *EndpointBodies, rand 
 		}
 	}
 
-	{
-		operationIDFormat = defaultOperationIDFormat
-		setOperationIDFormat(expr.Root.API.Meta)
-		setOperationIDFormat(m.Service.Meta)
-		setOperationIDFormat(r.Endpoint.Meta)
-		setOperationIDFormat(m.Meta)
-	}
+	operationIDFormat = defaultOperationIDFormat
+	setOperationIDFormat(meta)
+	setOperationIDFormat(m.Service.Meta)
+	setOperationIDFormat(e.Meta)
+	setOperationIDFormat(m.Meta)
 
 	// request body
 	var requestBody *RequestBodyRef
@@ -281,52 +275,47 @@ func buildOperation(key string, r *expr.RouteExpr, bodies *EndpointBodies, rand 
 	}
 
 	// responses
-	var responses map[string]*ResponseRef
-	{
-		responses = make(map[string]*ResponseRef, len(e.Responses))
-		for _, r := range e.Responses {
-			if e.MethodExpr.IsStreaming() {
-				// A streaming endpoint allows at most one successful response
-				// definition. So it is okay to change the first successful
-				// response to a HTTP 101 response for openapi docs.
-				if _, ok := responses[strconv.Itoa(expr.StatusSwitchingProtocols)]; !ok {
-					b := bodies.ResponseBodies[r.StatusCode]
-					delete(bodies.ResponseBodies, r.StatusCode)
-					r = r.Dup()
-					r.StatusCode = expr.StatusSwitchingProtocols
-					bodies.ResponseBodies[r.StatusCode] = b
-				}
+	responses := make(map[string]*ResponseRef, len(e.Responses))
+	for _, r := range e.Responses {
+		if e.MethodExpr.IsStreaming() {
+			// A streaming endpoint allows at most one successful response
+			// definition. So it is okay to change the first successful
+			// response to a HTTP 101 response for openapi docs.
+			if _, ok := responses[strconv.Itoa(expr.StatusSwitchingProtocols)]; !ok {
+				b := bodies.ResponseBodies[r.StatusCode]
+				delete(bodies.ResponseBodies, r.StatusCode)
+				r = r.Dup()
+				r.StatusCode = expr.StatusSwitchingProtocols
+				bodies.ResponseBodies[r.StatusCode] = b
 			}
-			resp := responseFromExpr(r, bodies.ResponseBodies, rand)
-			responses[strconv.Itoa(r.StatusCode)] = &ResponseRef{Value: resp}
 		}
-		for _, er := range e.HTTPErrors {
-			if er.Description != "" && er.Response.Description == "" {
-				er.Response.Description = er.Description
-			}
-			resp := responseFromExpr(er.Response, bodies.ResponseBodies, rand)
-			desc := er.Name
-			if resp.Description != nil {
-				desc += ": " + *resp.Description
-			}
-			resp.Description = &desc
-			if er.Type == expr.ErrorResult && len(er.Response.Body.ExtractUserExamples()) == 0 {
-				for _, content := range resp.Content {
-					content.Example = nil
-				}
-			}
-			responses[strconv.Itoa(er.Response.StatusCode)] = &ResponseRef{Value: resp}
+		resp := responseFromExpr(r, bodies.ResponseBodies, rand)
+		responses[strconv.Itoa(r.StatusCode)] = &ResponseRef{Value: resp}
+	}
+	for _, er := range e.HTTPErrors {
+		if er.Description != "" && er.Response.Description == "" {
+			er.Response.Description = er.Description
 		}
+		resp := responseFromExpr(er.Response, bodies.ResponseBodies, rand)
+		desc := er.Name
+		if resp.Description != nil {
+			desc += ": " + *resp.Description
+		}
+		resp.Description = &desc
+		if er.Type == expr.ErrorResult && len(er.Response.Body.ExtractUserExamples()) == 0 {
+			for _, content := range resp.Content {
+				content.Example = nil
+			}
+		}
+		responses[strconv.Itoa(er.Response.StatusCode)] = &ResponseRef{Value: resp}
 	}
 
 	// tag names
 	var tagNames []string
-	{
-		tagNames = openapi.TagNamesFromExpr(e.Meta)
-		if len(tagNames) == 0 {
-			// By default tag with service name
-			tagNames = []string{r.Endpoint.Service.Name()}
-		}
+	tagNames = openapi.TagNamesFromExpr(e.Meta)
+	if len(tagNames) == 0 {
+		// By default tag with service name
+		tagNames = []string{e.Service.Name()}
 	}
 
 	// An endpoint can have multiple routes, so we need to be able to build a unique
@@ -339,6 +328,8 @@ func buildOperation(key string, r *expr.RouteExpr, bodies *EndpointBodies, rand 
 		}
 	}
 
+	// An endpoint may be marked as deprecated. if the openapi:deprecated tag is present, we populate it to true
+	_, deprecated := e.Meta.Last("openapi:deprecated")
 	return &Operation{
 		Tags:         tagNames,
 		Summary:      summary,
@@ -348,31 +339,29 @@ func buildOperation(key string, r *expr.RouteExpr, bodies *EndpointBodies, rand 
 		RequestBody:  requestBody,
 		Responses:    responses,
 		Security:     buildSecurityRequirements(e.Requirements),
-		Deprecated:   false,
+		Deprecated:   deprecated,
 		ExternalDocs: openapi.DocsFromExpr(m.Docs, m.Meta),
 		Extensions:   openapi.ExtensionsFromExpr(m.Meta),
 	}
 }
 
-// buildOperation builds the OpenAPI Operation object for the given file server.
+// buildFileServerOperation builds the OpenAPI Operation object for the given file server.
 func buildFileServerOperation(key string, fs *expr.HTTPFileServerExpr, api *expr.APIExpr) *Operation {
 	wildcards := expr.ExtractHTTPWildcards(key)
 	svc := fs.Service
 
 	// parameters
 	var params []*ParameterRef
-	{
-		if len(wildcards) > 0 {
-			pref := ParameterRef{
-				Value: &Parameter{
-					Name:        wildcards[0],
-					Description: "Relative file path",
-					In:          "path",
-					Required:    true,
-				},
-			}
-			params = []*ParameterRef{&pref}
+	if len(wildcards) > 0 {
+		pref := ParameterRef{
+			Value: &Parameter{
+				Name:        wildcards[0],
+				Description: "Relative file path",
+				In:          "path",
+				Required:    true,
+			},
 		}
+		params = []*ParameterRef{&pref}
 	}
 
 	// responses
@@ -399,12 +388,10 @@ func buildFileServerOperation(key string, fs *expr.HTTPFileServerExpr, api *expr
 
 	// OpenAPI summary
 	var summary string
-	{
-		summary = fmt.Sprintf("Download %s", fs.FilePath)
-		for n, mdata := range fs.Meta {
-			if (n == "openapi:summary" || n == "swagger:summary") && len(mdata) > 0 {
-				summary = mdata[0]
-			}
+	summary = fmt.Sprintf("Download %s", fs.FilePath)
+	for n, mdata := range fs.Meta {
+		if (n == "openapi:summary" || n == "swagger:summary") && len(mdata) > 0 {
+			summary = mdata[0]
 		}
 	}
 
@@ -418,21 +405,17 @@ func buildFileServerOperation(key string, fs *expr.HTTPFileServerExpr, api *expr
 		}
 	}
 
-	{
-		operationIDFormat = defaultOperationIDFormat
-		setOperationIDFormat(api.Meta)
-		setOperationIDFormat(svc.Meta)
-		setOperationIDFormat(fs.Meta)
-	}
+	operationIDFormat = defaultOperationIDFormat
+	setOperationIDFormat(api.Meta)
+	setOperationIDFormat(svc.Meta)
+	setOperationIDFormat(fs.Meta)
 
 	// tag names
 	var tagNames []string
-	{
-		tagNames = openapi.TagNamesFromExpr(fs.Meta)
-		if len(tagNames) == 0 {
-			// By default tag with service name
-			tagNames = []string{svc.Name()}
-		}
+	tagNames = openapi.TagNamesFromExpr(fs.Meta)
+	if len(tagNames) == 0 {
+		// By default tag with service name
+		tagNames = []string{svc.Name()}
 	}
 
 	return &Operation{
@@ -481,12 +464,12 @@ func parseOperationIDTemplate(template, service, method string, routeIndex int) 
 func buildServers(servers []*expr.ServerExpr) []*Server {
 	var svrs []*Server
 	for _, svr := range servers {
-		if !mustGenerate(svr.Meta) {
+		if !openapi.MustGenerate(svr.Meta) {
 			continue
 		}
 		var server *Server
 		for _, host := range svr.Hosts {
-			if !mustGenerate(host.Meta) {
+			if !openapi.MustGenerate(host.Meta) {
 				continue
 			}
 
@@ -548,12 +531,14 @@ func buildSecurityRequirements(reqs []*expr.SecurityExpr) []map[string][]string 
 	for i, req := range reqs {
 		sr := make(map[string][]string, len(req.Schemes))
 		for _, sch := range req.Schemes {
+			scopes := make([]string, 0)
 			switch sch.Kind {
-			case expr.BasicAuthKind, expr.APIKeyKind:
-				sr[sch.Hash()] = []string{}
 			case expr.OAuth2Kind, expr.JWTKind:
-				sr[sch.Hash()] = req.Scopes
+				if len(req.Scopes) > 0 {
+					scopes = req.Scopes
+				}
 			}
+			sr[sch.Hash()] = scopes
 		}
 		srs[i] = sr
 	}
@@ -639,7 +624,7 @@ func buildTags(api *expr.APIExpr) []*openapi.Tag {
 		m[t.Name] = t
 	}
 	for _, s := range api.HTTP.Services {
-		if !mustGenerate(s.Meta) || !mustGenerate(s.ServiceExpr.Meta) {
+		if !openapi.MustGenerate(s.Meta) || !openapi.MustGenerate(s.ServiceExpr.Meta) {
 			continue
 		}
 		for _, t := range openapi.TagsFromExpr(s.Meta) {
@@ -648,44 +633,29 @@ func buildTags(api *expr.APIExpr) []*openapi.Tag {
 	}
 
 	// sort tag names alphabetically
-	var keys []string
+	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
-	var tags []*openapi.Tag
-	{
-		for _, k := range keys {
-			tags = append(tags, m[k])
-		}
+	tags := make([]*openapi.Tag, 0, len(keys))
+	for _, k := range keys {
+		tags = append(tags, m[k])
+	}
 
-		if len(tags) == 0 {
-			// add service name and description to the tags since we tag every
-			// operation with service name when no custom tag is defined
-			for _, s := range api.HTTP.Services {
-				if !mustGenerate(s.Meta) || !mustGenerate(s.ServiceExpr.Meta) {
-					continue
-				}
-				tags = append(tags, &openapi.Tag{
-					Name:        s.Name(),
-					Description: s.Description(),
-				})
+	if len(tags) == 0 {
+		// add service name and description to the tags since we tag every
+		// operation with service name when no custom tag is defined
+		for _, s := range api.HTTP.Services {
+			if !openapi.MustGenerate(s.Meta) || !openapi.MustGenerate(s.ServiceExpr.Meta) {
+				continue
 			}
+			tags = append(tags, &openapi.Tag{
+				Name:        s.Name(),
+				Description: s.Description(),
+			})
 		}
 	}
 	return tags
-}
-
-// mustGenerate returns true if the meta indicates that a OpenAPI specification should be
-// generated, false otherwise.
-func mustGenerate(meta expr.MetaExpr) bool {
-	m, ok := meta.Last("openapi:generate")
-	if !ok {
-		m, ok = meta.Last("swagger:generate")
-	}
-	if ok && m == "false" {
-		return false
-	}
-	return true
 }
