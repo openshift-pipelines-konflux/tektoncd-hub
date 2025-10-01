@@ -23,7 +23,7 @@
 						log.Fatal(ctx, fmt.Errorf("invalid value for URL '{{ .Name }}' variable: %q (valid values: {{ join .Values "," }})\n", *{{ .VarName }}F))
 					}
 				{{- end }}
-				addr = strings.Replace(addr, "{{ printf "{%s}" .Name }}", *{{ .VarName }}F, -1)
+				addr = strings.ReplaceAll(addr, "{{ printf "{%s}" .Name }}", *{{ .VarName }}F)
 			{{- end }}
 			u, err := url.Parse(addr)
 			if err != nil {
@@ -44,11 +44,11 @@
 			} else if u.Port() == "" {
 				u.Host = net.JoinHostPort(u.Host, "{{ $u.Port }}")
 			}
-			handle{{ toUpper $u.Transport.Name }}Server(ctx, u, {{ range $t := $.Server.Transports }}{{ if eq $t.Type $u.Transport.Type }}{{ range $s := $t.Services }}{{ range $.Services }}{{ if eq $s .Name }}{{ if .Methods }}{{ .VarName }}Endpoints, {{ end }}{{ end }}{{ end }}{{ end }}{{ end }}{{ end }}&wg, errc, *dbgF)
+			handle{{ toUpper $u.Transport.Name }}Server(ctx, u{{- range $u.HandlerArgs }}{{- if .Endpoint }}, {{ .Endpoint }}{{- end }}{{- if .Service }}, {{ .Service }}{{- end }}{{- end }}, &wg, errc, *dbgF)
 		}
-	{{- end }}
+		{{- end }}
 	{{ end }}
 {{- end }}
 	default:
 		log.Fatal(ctx, fmt.Errorf("invalid host argument: %q (valid hosts: {{ join .Server.AvailableHosts "|" }})", *hostF))
-	}	
+	}

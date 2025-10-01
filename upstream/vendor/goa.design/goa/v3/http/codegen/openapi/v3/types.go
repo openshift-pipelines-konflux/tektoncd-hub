@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/gohugoio/hashstructure"
+
 	"goa.design/goa/v3/codegen"
 	"goa.design/goa/v3/expr"
 	"goa.design/goa/v3/http/codegen/openapi"
@@ -59,18 +61,18 @@ func newSchemafier(rand *expr.ExampleGenerator) *schemafier {
 // value indexed by type name.
 //
 // NOTE: entries are nil when the corresponding type is Empty.
-func buildBodyTypes(api *expr.APIExpr) (map[string]map[string]*EndpointBodies, map[string]*openapi.Schema) {
+func buildBodyTypes(api *expr.APIExpr, types []expr.UserType, resultTypes []*expr.ResultTypeExpr) (map[string]map[string]*EndpointBodies, map[string]*openapi.Schema) {
 	bodies := make(map[string]map[string]*EndpointBodies)
 	sf := newSchemafier(api.ExampleGenerator)
 
 	// Generates the types referenced from the endpoints.
-	for _, t := range expr.Root.Types {
+	for _, t := range types {
 		if !mustGenerateType(t.Attribute().Meta) {
 			continue
 		}
 		sf.schemafy(&expr.AttributeExpr{Type: t})
 	}
-	for _, t := range expr.Root.ResultTypes {
+	for _, t := range resultTypes {
 		if !mustGenerateType(t.Attribute().Meta) {
 			continue
 		}
@@ -201,13 +203,12 @@ func (sf *schemafier) schemafy(attr *expr.AttributeExpr, noref ...bool) *openapi
 		}
 	case *expr.Map:
 		s.Type = openapi.Object
-		// OpenAPI lets you define dictionaries where the keys are strings.
-		// See https://swagger.io/docs/specification/data-models/dictionaries/.
-		if t.KeyType.Type == expr.String && t.ElemType.Type != expr.Any {
-			// Use free-form objects when elements are of type "Any"
-			s.AdditionalProperties = sf.schemafy(t.ElemType)
-		} else if t.KeyType.Type != expr.Any {
+		if t.ElemType.Type == expr.Any {
+			// Use free-form objects when elements are of type "Any", otherwise, use full schema
+			// See https://swagger.io/docs/specification/data-models/dictionaries/.
 			s.AdditionalProperties = true
+		} else {
+			s.AdditionalProperties = sf.schemafy(t.ElemType)
 		}
 	case *expr.Union:
 		for _, val := range t.Values {
@@ -264,6 +265,9 @@ func (sf *schemafier) schemafy(attr *expr.AttributeExpr, noref ...bool) *openapi
 	s.Extensions = openapi.ExtensionsFromExpr(attr.Meta)
 
 	// Validations
+	if ap := openapi.AdditionalPropertiesFromExpr(attr.Meta); ap != nil {
+		s.AdditionalProperties = ap
+	}
 	val := attr.Validation
 	if val == nil {
 		return s
@@ -376,7 +380,7 @@ func toString(val any) string {
 // identifiers. Structurally identical means same primitive types, arrays with
 // structurally equivalent element types, maps with structurally equivalent key
 // and value types or object with identical attribute names and structurally
-// equivalent types and identical set of required attributes.
+// equivalent types and identical set of validation rules.
 func (*schemafier) hashAttribute(att *expr.AttributeExpr, h hash.Hash64) uint64 {
 	return *hashAttribute(att, h, make(map[string]*uint64))
 }
@@ -393,6 +397,7 @@ func hashAttribute(att *expr.AttributeExpr, h hash.Hash64, seen map[string]*uint
 	}
 	seen[t.Hash()] = res
 
+	hv := hashValidation(att.Validation, h)
 	switch t.Kind() {
 	case expr.ObjectKind:
 		o := expr.AsObject(t)
@@ -402,27 +407,28 @@ func hashAttribute(att *expr.AttributeExpr, h hash.Hash64, seen map[string]*uint
 			}
 			kh := hashString(m.Name, h)
 			vh := hashAttribute(m.Attribute, h, seen)
-			*res = *res ^ orderedHash(kh, *vh, h)
+			*res ^= orderedHash(kh, *vh, h)
 		}
-		// Objects with a different set of required attributes should produce
-		// different hashes.
-		if att.Validation != nil {
-			for _, req := range att.Validation.Required {
-				rh := hashString(req, h)
-				*res = *res ^ rh
-			}
+		if hv != 0 {
+			*res = orderedHash(*res, hv, h)
 		}
 
 	case expr.ArrayKind:
 		kh := hashString("[]", h)
 		vh := hashAttribute(expr.AsArray(t).ElemType, h, seen)
 		*res = orderedHash(kh, *vh, h)
+		if hv != 0 {
+			*res = orderedHash(*res, hv, h)
+		}
 
 	case expr.MapKind:
 		m := expr.AsMap(t)
 		kh := hashAttribute(m.KeyType, h, seen)
 		vh := hashAttribute(m.ElemType, h, seen)
 		*res = orderedHash(*kh, *vh, h)
+		if hv != 0 {
+			*res = orderedHash(*res, hv, h)
+		}
 
 	case expr.UserTypeKind:
 		*res = *hashAttribute(t.(expr.UserType).Attribute(), h, seen)
@@ -432,14 +438,37 @@ func hashAttribute(att *expr.AttributeExpr, h hash.Hash64, seen map[string]*uint
 		// the computation of the hash.
 		rt := t.(*expr.ResultTypeExpr)
 		*res = hashString(rt.Identifier, h)
-		if view, ok := rt.AttributeExpr.Meta.Last(expr.ViewMetaKey); ok {
+		if view, ok := rt.Meta.Last(expr.ViewMetaKey); ok {
 			*res = orderedHash(*res, hashString(view, h), h)
 		}
 
 	default: // Primitives or Any
 		*res = hashString(t.Name(), h)
+		if hv != 0 {
+			*res = orderedHash(*res, hv, h)
+		}
 	}
 
+	return res
+}
+
+func hashValidation(val *expr.ValidationExpr, h hash.Hash64) uint64 {
+	// Note: we can't use hashstructure for attributes because it doesn't
+	// handle recursive structures.
+	if val == nil {
+		return 0
+	}
+
+	res, err := hashstructure.Hash(val, &hashstructure.HashOptions{
+		Hasher:          h,
+		ZeroNil:         false,
+		IgnoreZeroValue: true,
+		SlicesAsSets:    true,
+	})
+	if err != nil {
+		// should really never happen (OOM maybe)
+		return 0
+	}
 	return res
 }
 

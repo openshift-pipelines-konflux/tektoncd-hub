@@ -24,10 +24,15 @@ func (c *{{ .ClientStruct }}) {{ .Method.VarName }}() goa.Endpoint {
 			case *goapb.ErrorResponse:
 				return nil, goagrpc.NewServiceError(message)
 			default:
-				return nil, goa.Fault(err.Error())
+				return nil, goa.Fault("%s", err.Error())
 			}
 		{{- else }}
-			return nil, goa.Fault(err.Error())
+			// Try to decode a Goa error response detail before falling back to Fault.
+			resp := goagrpc.DecodeError(err)
+			if eresp, ok := resp.(*goapb.ErrorResponse); ok {
+				return nil, goagrpc.NewServiceError(eresp)
+			}
+			return nil, goa.Fault("%s", err.Error())
 		{{- end }}
 		}
 		return res, nil

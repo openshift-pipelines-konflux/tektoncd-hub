@@ -32,6 +32,10 @@ type (
 		// schemes. Incoming requests must validate at least one
 		// requirement to be authorized.
 		Requirements []*SecurityExpr
+		// ClientInterceptors is the list of client interceptors.
+		ClientInterceptors []*InterceptorExpr
+		// ServerInterceptors is the list of server interceptors.
+		ServerInterceptors []*InterceptorExpr
 		// Service that owns method.
 		Service *ServiceExpr
 		// Meta is an arbitrary set of key/value pairs, see dsl.Meta
@@ -41,6 +45,11 @@ type (
 		Stream StreamKind
 		// StreamingPayload is the payload sent across the stream.
 		StreamingPayload *AttributeExpr
+		// StreamingResult is the result sent across the stream when using SSE.
+		// When both Result and StreamingResult are defined with different types,
+		// the method supports content negotiation between standard HTTP responses
+		// (using Result) and SSE streams (using StreamingResult).
+		StreamingResult *AttributeExpr
 	}
 )
 
@@ -84,7 +93,8 @@ func (m *MethodExpr) EvalName() string {
 }
 
 // Prepare makes sure the payload and result types are initialized (to the Empty
-// type if nil).
+// type if nil) and merges the method interceptors with the API and service level
+// interceptors.
 func (m *MethodExpr) Prepare() {
 	if m.Payload == nil {
 		m.Payload = &AttributeExpr{Type: Empty}
@@ -92,22 +102,51 @@ func (m *MethodExpr) Prepare() {
 	if m.StreamingPayload == nil {
 		m.StreamingPayload = &AttributeExpr{Type: Empty}
 	}
+	
+	// Backward compatibility: if StreamingResult is set but Result is not,
+	// copy StreamingResult to Result so existing code generation continues to work
+	if m.StreamingResult != nil && m.Result == nil {
+		m.Result = m.StreamingResult
+	}
+	
+	// Initialize Result to Empty if still nil
 	if m.Result == nil {
 		m.Result = &AttributeExpr{Type: Empty}
 	}
+	
+	// If this is a streaming method without explicit StreamingResult,
+	// use Result for backward compatibility
+	if m.StreamingResult == nil && m.Stream != NoStreamKind {
+		m.StreamingResult = m.Result
+	}
 }
 
-// Validate validates the method payloads, results, and errors (if any).
+// Validate validates the method payloads, results, errors, security
+// requirements, and interceptors.
 func (m *MethodExpr) Validate() error {
 	verr := new(eval.ValidationErrors)
 	verr.Merge(m.Payload.Validate("payload", m))
-	// validate security scheme requirements
+	verr.Merge(m.StreamingPayload.Validate("streaming_payload", m))
+	verr.Merge(m.Result.Validate("result", m))
+	if m.StreamingResult != nil && m.StreamingResult != m.Result {
+		verr.Merge(m.StreamingResult.Validate("streaming_result", m))
+	}
+	verr.Merge(m.validateRequirements())
+	verr.Merge(m.validateErrors())
+	verr.Merge(m.validateInterceptors())
+	return verr
+}
+
+// validateRequirements validates the security requirements.
+func (m *MethodExpr) validateRequirements() *eval.ValidationErrors {
+	verr := new(eval.ValidationErrors)
 	var requirements []*SecurityExpr
-	if len(m.Requirements) > 0 {
+	switch {
+	case len(m.Requirements) > 0:
 		requirements = m.Requirements
-	} else if len(m.Service.Requirements) > 0 {
+	case len(m.Service.Requirements) > 0:
 		requirements = m.Service.Requirements
-	} else if len(Root.API.Requirements) > 0 {
+	case len(Root.API.Requirements) > 0:
 		requirements = Root.API.Requirements
 	}
 	var (
@@ -185,12 +224,12 @@ func (m *MethodExpr) Validate() error {
 			verr.Add(m, "payload of method %q of service %q defines a OAuth2 access token attribute, but no OAuth2 security scheme exist", m.Name, m.Service.Name)
 		}
 	}
-	if m.StreamingPayload.Type != Empty {
-		verr.Merge(m.StreamingPayload.Validate("streaming_payload", m))
-	}
-	if m.Result.Type != Empty {
-		verr.Merge(m.Result.Validate("result", m))
-	}
+	return verr
+}
+
+// validateErrors validates the method errors.
+func (m *MethodExpr) validateErrors() *eval.ValidationErrors {
+	verr := new(eval.ValidationErrors)
 	for i, e := range m.Errors {
 		if err := e.Validate(); err != nil {
 			var verrs *eval.ValidationErrors
@@ -211,13 +250,51 @@ func (m *MethodExpr) Validate() error {
 					return nil
 				})
 				if !found {
-					verr.Add(e, "type %q is used to define multiple errors and must identify the attribute containing the error name with ErrorName", e.AttributeExpr.Type.Name())
+					verr.Add(e, "type %q is used to define multiple errors and must identify the attribute containing the error name with ErrorName", e.Type.Name())
 					break
 				}
 			}
 		}
 	}
 	return verr
+}
+
+// validateInterceptors validates the method interceptors.
+func (m *MethodExpr) validateInterceptors() *eval.ValidationErrors {
+	verr := new(eval.ValidationErrors)
+	m.ClientInterceptors = mergeInterceptors(m.ClientInterceptors, m.Service.ClientInterceptors, Root.API.ClientInterceptors)
+	for _, i := range m.ClientInterceptors {
+		verr.Merge(i.validate(m))
+	}
+	m.ServerInterceptors = mergeInterceptors(m.ServerInterceptors, m.Service.ServerInterceptors, Root.API.ServerInterceptors)
+	for _, i := range m.ServerInterceptors {
+		verr.Merge(i.validate(m))
+	}
+	return verr
+}
+
+// mergeInterceptors merges interceptors from different levels (method, service, API)
+// while avoiding duplicates. The order of precedence is: method > service > API.
+func mergeInterceptors(methodLevel, serviceLevel, apiLevel []*InterceptorExpr) []*InterceptorExpr {
+	existing := make(map[string]struct{})
+	result := make([]*InterceptorExpr, 0, len(methodLevel)+len(serviceLevel)+len(apiLevel))
+
+	for _, i := range methodLevel {
+		existing[i.Name] = struct{}{}
+		result = append(result, i)
+	}
+	for _, i := range serviceLevel {
+		if _, ok := existing[i.Name]; !ok {
+			result = append(result, i)
+			existing[i.Name] = struct{}{}
+		}
+	}
+	for _, i := range apiLevel {
+		if _, ok := existing[i.Name]; !ok {
+			result = append(result, i)
+		}
+	}
+	return result
 }
 
 // hasTag is a helper function that traverses the given attribute and all its
@@ -278,6 +355,16 @@ func (m *MethodExpr) Finalize() {
 	} else {
 		m.StreamingPayload.Finalize()
 	}
+	
+	// Handle StreamingResult finalization
+	if m.StreamingResult != nil {
+		m.StreamingResult.Finalize()
+		if rt, ok := m.StreamingResult.Type.(*ResultTypeExpr); ok {
+			rt.Finalize()
+		}
+	}
+	
+	// Handle Result finalization (may be same as StreamingResult for backward compat)
 	if m.Result == nil {
 		m.Result = &AttributeExpr{Type: Empty}
 	} else {
@@ -340,6 +427,12 @@ func (m *MethodExpr) IsPayloadStreaming() bool {
 // IsResultStreaming determines whether the method streams payload.
 func (m *MethodExpr) IsResultStreaming() bool {
 	return m.Stream == ServerStreamKind || m.Stream == BidirectionalStreamKind
+}
+
+// HasMixedResults returns true if the method has both Result and StreamingResult
+// defined with different types, indicating support for content negotiation.
+func (m *MethodExpr) HasMixedResults() bool {
+	return m.Result != nil && m.StreamingResult != nil && m.Result != m.StreamingResult
 }
 
 // helper function that duplicates just enough of a security expression so that
