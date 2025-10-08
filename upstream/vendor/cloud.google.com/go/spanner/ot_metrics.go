@@ -17,14 +17,13 @@ package spanner
 import (
 	"context"
 	"log"
-	"strconv"
-	"strings"
 	"sync"
 
 	"cloud.google.com/go/spanner/internal"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -49,16 +48,30 @@ var (
 	otMu = sync.RWMutex{}
 )
 
-func createOpenTelemetryConfig(mp metric.MeterProvider, logger *log.Logger, sessionClientID string, db string) (*openTelemetryConfig, error) {
-	config := &openTelemetryConfig{
-		attributeMap: []attribute.KeyValue{},
-	}
-	if !IsOpenTelemetryMetricsEnabled() {
-		return config, nil
-	}
+func createOpenTelemetryConfig(ctx context.Context, mp metric.MeterProvider, logger *log.Logger, sessionClientID string, db string) (*openTelemetryConfig, error) {
+	// Important: snapshot the value of the global variable to ensure a
+	// consistent value for the lifetime of this client.
+	enabled := IsOpenTelemetryMetricsEnabled()
 	_, instance, database, err := parseDatabaseName(db)
 	if err != nil {
 		return nil, err
+	}
+	config := &openTelemetryConfig{
+		enabled:      enabled,
+		attributeMap: []attribute.KeyValue{},
+		commonTraceStartOptions: []trace.SpanStartOption{
+			trace.WithAttributes(
+				attribute.String("db.name", database),
+				attribute.String("instance.name", instance),
+				attribute.String("cloud.region", detectClientLocation(ctx)),
+				attribute.String("gcp.client.version", internal.Version),
+				attribute.String("gcp.client.repo", gcpClientRepo),
+				attribute.String("gcp.client.artifact", gcpClientArtifact),
+			),
+		},
+	}
+	if !enabled {
+		return config, nil
 	}
 
 	// Construct attributes for Metrics
@@ -89,7 +102,7 @@ func setOpenTelemetryMetricProvider(config *openTelemetryConfig, mp metric.Meter
 }
 
 func initializeMetricInstruments(config *openTelemetryConfig, logger *log.Logger) {
-	if !IsOpenTelemetryMetricsEnabled() {
+	if !config.enabled {
 		return
 	}
 	meter := config.meterProvider.Meter(OtInstrumentationScope, metric.WithInstrumentationVersion(internal.Version))
@@ -191,7 +204,7 @@ func initializeMetricInstruments(config *openTelemetryConfig, logger *log.Logger
 
 func registerSessionPoolOTMetrics(pool *sessionPool) error {
 	otConfig := pool.otConfig
-	if !IsOpenTelemetryMetricsEnabled() || otConfig == nil {
+	if otConfig == nil || !otConfig.enabled {
 		return nil
 	}
 
@@ -241,22 +254,18 @@ func setOpenTelemetryMetricsFlag(enable bool) {
 }
 
 func recordGFELatencyMetricsOT(ctx context.Context, md metadata.MD, keyMethod string, otConfig *openTelemetryConfig) error {
-	if !IsOpenTelemetryMetricsEnabled() || md == nil && otConfig == nil {
+	if otConfig == nil || !otConfig.enabled || md == nil {
 		return nil
 	}
 	attr := otConfig.attributeMap
-	if len(md.Get("server-timing")) == 0 && otConfig.gfeHeaderMissingCount != nil {
+	metrics := parseServerTimingHeader(md)
+	if len(metrics) == 0 && otConfig.gfeHeaderMissingCount != nil {
 		otConfig.gfeHeaderMissingCount.Add(ctx, 1, metric.WithAttributes(attr...))
 		return nil
 	}
-	serverTiming := md.Get("server-timing")[0]
-	gfeLatency, err := strconv.Atoi(strings.TrimPrefix(serverTiming, "gfet4t7; dur="))
-	if !strings.HasPrefix(serverTiming, "gfet4t7; dur=") || err != nil {
-		return err
-	}
 	attr = append(attr, attributeKeyMethod.String(keyMethod))
 	if otConfig.gfeLatency != nil {
-		otConfig.gfeLatency.Record(ctx, int64(gfeLatency), metric.WithAttributes(attr...))
+		otConfig.gfeLatency.Record(ctx, metrics[gfeTimingHeader].Milliseconds(), metric.WithAttributes(attr...))
 	}
 	return nil
 }
