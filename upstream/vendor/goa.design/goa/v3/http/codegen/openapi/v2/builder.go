@@ -2,8 +2,10 @@ package openapiv2
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -22,7 +24,7 @@ func NewV2(root *expr.RootExpr, h *expr.HostExpr) (*V2, error) {
 	if err != nil {
 		// This should never happen because server expression must have been
 		// validated. If it does, then we must fix server validation.
-		return nil, fmt.Errorf("failed to parse server URL: %s", err)
+		return nil, fmt.Errorf("failed to parse server URL: %w", err)
 	}
 	host := u.Host
 	if !openapi.MustGenerate(root.API.Servers[0].Meta) || !openapi.MustGenerate(h.Meta) {
@@ -66,9 +68,7 @@ func NewV2(root *expr.RootExpr, h *expr.HostExpr) (*V2, error) {
 		if !openapi.MustGenerate(res.Meta) || !openapi.MustGenerate(res.ServiceExpr.Meta) {
 			continue
 		}
-		for k, v := range openapi.ExtensionsFromExpr(res.Meta) {
-			s.Paths[k] = v
-		}
+		maps.Copy(s.Paths, openapi.ExtensionsFromExpr(res.Meta))
 		for _, fs := range res.FileServers {
 			if !openapi.MustGenerate(fs.Meta) || !openapi.MustGenerate(fs.Service.Meta) {
 				continue
@@ -121,7 +121,7 @@ func defaultURI(h *expr.HostExpr) string {
 // addScopeDescription generates and adds required scopes to the scheme's description.
 func addScopeDescription(scopes []*expr.ScopeExpr, sd *SecurityDefinition) {
 	// Generate scopes to add to description
-	var lines []string
+	lines := make([]string, 0, len(scopes))
 
 	for _, scope := range scopes {
 		lines = append(lines, fmt.Sprintf("  * `%s`: %s", scope.Name, scope.Description))
@@ -234,7 +234,7 @@ func hasAbsoluteRoutes(root *expr.RootExpr) bool {
 	return hasAbsoluteRoutes
 }
 
-func summaryFromExpr(name string, e *expr.HTTPEndpointExpr) string {
+func summaryFromExpr(name string, e *expr.HTTPEndpointExpr, meta expr.MetaExpr) string {
 	for n, mdata := range e.Meta {
 		if (n == "openapi:summary" || n == "swagger:summary") && len(mdata) > 0 {
 			return mdata[0]
@@ -250,7 +250,7 @@ func summaryFromExpr(name string, e *expr.HTTPEndpointExpr) string {
 			return mdata[0]
 		}
 	}
-	for n, mdata := range expr.Root.API.Meta {
+	for n, mdata := range meta {
 		if (n == "openapi:summary" || n == "swagger:summary") && len(mdata) > 0 {
 			return mdata[0]
 		}
@@ -277,12 +277,9 @@ func paramsFromExpr(params *expr.MappedAttributeExpr, path string) []*Parameter 
 	)
 	codegen.WalkMappedAttr(params, func(n, pn string, required bool, at *expr.AttributeExpr) error { // nolint: errcheck
 		in := "query"
-		for _, w := range wildcards {
-			if n == w {
-				in = "path"
-				required = true
-				break
-			}
+		if slices.Contains(wildcards, n) {
+			in = "path"
+			required = true
 		}
 		param := paramFor(at, pn, in, required)
 		res = append(res, param)
@@ -294,29 +291,11 @@ func paramsFromExpr(params *expr.MappedAttributeExpr, path string) []*Parameter 
 func paramsFromHeaders(endpoint *expr.HTTPEndpointExpr) []*Parameter {
 	var params []*Parameter
 
-	var (
-		rma = endpoint.Service.Params
-		ma  = endpoint.Headers
-
-		merged *expr.MappedAttributeExpr
-	)
-	{
-		if rma == nil {
-			merged = ma
-		} else if ma == nil {
-			merged = rma
-		} else {
-			merged = expr.DupMappedAtt(rma)
-			merged.Merge(ma)
-		}
-	}
-
-	for _, n := range *expr.AsObject(merged.Type) {
-		header := n.Attribute
-		required := merged.IsRequiredNoDefault(n.Name)
-		p := paramFor(header, merged.ElemName(n.Name), "header", required)
-		params = append(params, p)
-	}
+	expr.WalkMappedAttr(endpoint.Headers, func(name, elem string, att *expr.AttributeExpr) error { // nolint: errcheck
+		required := endpoint.Headers.IsRequiredNoDefault(name)
+		params = append(params, paramFor(att, elem, "header", required))
+		return nil
+	})
 
 	// Add basic auth to headers
 	if att := expr.TaggedAttribute(endpoint.MethodExpr.Payload, "security:username"); att != "" {
@@ -396,8 +375,8 @@ func responseSpecFromExpr(_ *V2, root *expr.RootExpr, r *expr.HTTPResponseExpr, 
 	var schema *openapi.Schema
 	if mt, ok := r.Body.Type.(*expr.ResultTypeExpr); ok {
 		view := expr.DefaultView
-		if v, ok := r.Body.Meta["view"]; ok {
-			view = v[0]
+		if v, ok := r.Body.Meta.Last(expr.ViewMetaKey); ok {
+			view = v
 		}
 		schema = openapi.NewSchema()
 		schema.Ref = openapi.ResultTypeRefWithPrefix(root.API, mt, view, typeNamePrefix)
@@ -539,13 +518,7 @@ func buildPathFromExpr(s *V2, root *expr.RootExpr, h *expr.HostExpr, route *expr
 			resp := responseSpecFromExpr(s, root, r, endpoint.Service.Name())
 			responses[strconv.Itoa(r.StatusCode)] = resp
 			if r.ContentType != "" {
-				foundCT := false
-				for _, ct := range produces {
-					if ct == r.ContentType {
-						foundCT = true
-						break
-					}
-				}
+				foundCT := slices.Contains(produces, r.ContentType)
 				if !foundCT {
 					produces = append(produces, r.ContentType)
 				}
@@ -617,7 +590,7 @@ func buildPathFromExpr(s *V2, root *expr.RootExpr, h *expr.HostExpr, route *expr
 		for i, req := range endpoint.Requirements {
 			requirement := make(map[string][]string)
 			for _, s := range req.Schemes {
-				requirement[s.Hash()] = []string{}
+				requirement[s.Hash()] = nil
 				switch s.Kind {
 				case expr.OAuth2Kind:
 					if len(req.Scopes) > 0 {
@@ -643,7 +616,7 @@ func buildPathFromExpr(s *V2, root *expr.RootExpr, h *expr.HostExpr, route *expr
 		operation := &Operation{
 			Tags:         tagNames,
 			Description:  description,
-			Summary:      summaryFromExpr(endpoint.Name()+" "+endpoint.Service.Name(), endpoint),
+			Summary:      summaryFromExpr(endpoint.Name()+" "+endpoint.Service.Name(), endpoint, root.API.Meta),
 			ExternalDocs: openapi.DocsFromExpr(endpoint.MethodExpr.Docs, endpoint.MethodExpr.Meta),
 			OperationID:  operationID,
 			Parameters:   params,
@@ -742,16 +715,16 @@ func initExclusiveMinimumValidation(def any, exclMin *float64) {
 	}
 }
 
-func initMinimumValidation(def any, min *float64) {
+func initMinimumValidation(def any, minimum *float64) {
 	switch actual := def.(type) {
 	case *Parameter:
-		actual.Minimum = min
+		actual.Minimum = minimum
 		actual.ExclusiveMinimum = false
 	case *Header:
-		actual.Minimum = min
+		actual.Minimum = minimum
 		actual.ExclusiveMinimum = false
 	case *Items:
-		actual.Minimum = min
+		actual.Minimum = minimum
 		actual.ExclusiveMinimum = false
 	}
 }
@@ -770,47 +743,47 @@ func initExclusiveMaximumValidation(def any, exclMax *float64) {
 	}
 }
 
-func initMaximumValidation(def any, max *float64) {
+func initMaximumValidation(def any, maximum *float64) {
 	switch actual := def.(type) {
 	case *Parameter:
-		actual.Maximum = max
+		actual.Maximum = maximum
 		actual.ExclusiveMaximum = false
 	case *Header:
-		actual.Maximum = max
+		actual.Maximum = maximum
 		actual.ExclusiveMaximum = false
 	case *Items:
-		actual.Maximum = max
+		actual.Maximum = maximum
 		actual.ExclusiveMaximum = false
 	}
 }
 
-func initMinLengthValidation(def any, isArray bool, min *int) {
+func initMinLengthValidation(def any, isArray bool, minLength *int) {
 	switch actual := def.(type) {
 	case *Parameter:
 		if isArray {
-			actual.MinItems = min
+			actual.MinItems = minLength
 		} else {
-			actual.MinLength = min
+			actual.MinLength = minLength
 		}
 	case *Header:
-		actual.MinLength = min
+		actual.MinLength = minLength
 	case *Items:
-		actual.MinLength = min
+		actual.MinLength = minLength
 	}
 }
 
-func initMaxLengthValidation(def any, isArray bool, max *int) {
+func initMaxLengthValidation(def any, isArray bool, maxLength *int) {
 	switch actual := def.(type) {
 	case *Parameter:
 		if isArray {
-			actual.MaxItems = max
+			actual.MaxItems = maxLength
 		} else {
-			actual.MaxLength = max
+			actual.MaxLength = maxLength
 		}
 	case *Header:
-		actual.MaxLength = max
+		actual.MaxLength = maxLength
 	case *Items:
-		actual.MaxLength = max
+		actual.MaxLength = maxLength
 	}
 }
 

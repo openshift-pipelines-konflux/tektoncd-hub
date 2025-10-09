@@ -2,6 +2,8 @@ package expr
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 
 	"goa.design/goa/v3/eval"
@@ -9,7 +11,10 @@ import (
 )
 
 // Root is the root object built by the DSL.
-var Root = &RootExpr{GeneratedTypes: &GeneratedRoot{}}
+var Root = new(RootExpr)
+
+// DefaultProtoc is the default command to be invoked for generating code from protobuf schemas.
+const DefaultProtoc = "protoc"
 
 type (
 	// RootExpr is the struct built by the DSL on process start.
@@ -18,16 +23,16 @@ type (
 		API *APIExpr
 		// Services contains the list of services exposed by the API.
 		Services []*ServiceExpr
+		// Interceptors contains the list of interceptors.
+		Interceptors []*InterceptorExpr
 		// Errors contains the list of errors returned by all the API
 		// methods.
 		Errors []*ErrorExpr
 		// Types contains the user types described in the DSL.
 		Types []UserType
-		// ResultTypes contains the result types described in the DSL.
-		ResultTypes []UserType
-		// GeneratedTypes contains the types generated during DSL
+		// ResultTypes contains the result types generated during DSL
 		// execution.
-		GeneratedTypes *GeneratedRoot
+		ResultTypes []*ResultTypeExpr
 		// Conversions list the user type to external type mappings.
 		Conversions []*TypeMap
 		// Creations list the external type to user type mappings.
@@ -72,12 +77,14 @@ func (r *RootExpr) WalkSets(walk eval.SetWalker) {
 	}
 	walk(types)
 
-	// Result types
-	mtypes := make(eval.ExpressionSet, len(r.ResultTypes))
-	for i, mt := range r.ResultTypes {
-		mtypes[i] = mt.(*ResultTypeExpr)
+	// Result types, note: initialized when the generated result types are
+	// walked so empty the first time around (in the first pass DSL
+	// execution). See ResultTypesRoot.WalkSets for details.
+	rtypes := make(eval.ExpressionSet, len(r.ResultTypes))
+	for i, rt := range r.ResultTypes {
+		rtypes[i] = rt
 	}
-	walk(mtypes)
+	walk(rtypes)
 
 	// Services
 	walk(eval.ToExpressionSet(r.Services))
@@ -92,25 +99,10 @@ func (r *RootExpr) WalkSets(walk eval.SetWalker) {
 	walk(methods)
 
 	// HTTP services and endpoints
-	httpsvcs := make(eval.ExpressionSet, len(r.API.HTTP.Services))
-	sort.SliceStable(r.API.HTTP.Services, func(i, j int) bool {
-		return r.API.HTTP.Services[j].ParentName == r.API.HTTP.Services[i].Name()
-	})
-	var httpepts eval.ExpressionSet
-	var httpsvrs eval.ExpressionSet
-	for i, svc := range r.API.HTTP.Services {
-		httpsvcs[i] = svc
-		for _, e := range svc.HTTPEndpoints {
-			httpepts = append(httpepts, e)
-		}
-		for _, s := range svc.FileServers {
-			httpsvrs = append(httpsvrs, s)
-		}
-	}
-	walk(eval.ExpressionSet{r.API.HTTP})
-	walk(httpsvcs)
-	walk(httpepts)
-	walk(httpsvrs)
+	r.walkHTTPServices(r.API.HTTP.Services, walk)
+
+	// JSON-RPC services and endpoints
+	r.walkHTTPServices(r.API.JSONRPC.Services, walk)
 
 	// GRPC services and endpoints
 	grpcsvcs := make(eval.ExpressionSet, len(r.API.GRPC.Services))
@@ -157,18 +149,6 @@ func (r *RootExpr) UserType(name string) UserType {
 	return nil
 }
 
-// GeneratedResultType returns the generated result type expression with the given
-// id, nil if there isn't one.
-func (r *RootExpr) GeneratedResultType(id string) *ResultTypeExpr {
-	for _, t := range *r.GeneratedTypes {
-		mt := t.(*ResultTypeExpr)
-		if mt.Identifier == id {
-			return mt
-		}
-	}
-	return nil
-}
-
 // Service returns the service with the given name.
 func (r *RootExpr) Service(name string) *ServiceExpr {
 	for _, s := range r.Services {
@@ -187,29 +167,6 @@ func (r *RootExpr) Error(name string) *ErrorExpr {
 		}
 	}
 	return nil
-}
-
-// HTTPService returns the HTTP service with the given name if any.
-func (r *RootExpr) HTTPService(name string) *HTTPServiceExpr {
-	for _, res := range r.API.HTTP.Services {
-		if res.Name() == name {
-			return res
-		}
-	}
-	return nil
-}
-
-// HTTPServiceFor creates a new or returns the existing HTTP service definition
-// for the given service.
-func (r *RootExpr) HTTPServiceFor(s *ServiceExpr) *HTTPServiceExpr {
-	if res := r.HTTPService(s.Name); res != nil {
-		return res
-	}
-	res := &HTTPServiceExpr{
-		ServiceExpr: s,
-	}
-	r.API.HTTP.Services = append(r.API.HTTP.Services, res)
-	return res
 }
 
 // EvalName is the name of the DSL.
@@ -242,12 +199,33 @@ func (r *RootExpr) Finalize() {
 	}
 }
 
+// walkHTTPServices walks the HTTP services and endpoints.
+func (r *RootExpr) walkHTTPServices(svcs []*HTTPServiceExpr, walk eval.SetWalker) {
+	sort.SliceStable(svcs, func(i, j int) bool {
+		return svcs[j].ParentName == svcs[i].Name()
+	})
+	var httpepts eval.ExpressionSet
+	var httpsvrs eval.ExpressionSet
+	httpsvcs := make(eval.ExpressionSet, len(svcs))
+	for i, svc := range svcs {
+		httpsvcs[i] = svc
+		for _, e := range svc.HTTPEndpoints {
+			httpepts = append(httpepts, e)
+		}
+		for _, s := range svc.FileServers {
+			httpsvrs = append(httpsvrs, s)
+		}
+	}
+	walk(eval.ExpressionSet{r.API.HTTP})
+	walk(httpsvcs)
+	walk(httpepts)
+	walk(httpsvrs)
+}
+
 // Dup creates a new map from the given expression.
 func (m MetaExpr) Dup() MetaExpr {
 	d := make(MetaExpr, len(m))
-	for k, v := range m {
-		d[k] = v
-	}
+	maps.Copy(d, m)
 	return d
 }
 
@@ -259,13 +237,7 @@ func (m MetaExpr) Merge(src MetaExpr) {
 		if mvals, ok := m[k]; ok {
 			var found bool
 			for _, v := range vals {
-				found = false
-				for _, mv := range mvals {
-					if mv == v {
-						found = true
-						break
-					}
-				}
+				found = slices.Contains(mvals, v)
 				if !found {
 					mvals = append(mvals, v)
 				}

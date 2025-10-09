@@ -296,7 +296,7 @@ qp := r.URL.Query()
 {{- range .Cookies }}
 	c, {{ if not .Required }}_{{ else }}err{{ end }} = r.Cookie("{{ .HTTPName }}")
 	{{- if and (or (eq .Type.Name "string") (eq .Type.Name "any")) .Required }}
-		if err == http.ErrNoCookie {
+		if errors.Is(err, http.ErrNoCookie) {
 			err = goa.MergeErrors(err, goa.MissingFieldError("{{ .Name }}", "cookie"))
 		} else {
 			{{ .VarName }} = c.Value
@@ -345,4 +345,4 @@ qp := r.URL.Query()
 		{{ .Validate }}
 	{{- end }}
 {{- end }}
-{{- end -}}
+{{- end }}

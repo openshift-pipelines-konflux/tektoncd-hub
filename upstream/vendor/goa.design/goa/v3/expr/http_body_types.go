@@ -128,6 +128,9 @@ func httpRequestBody(a *HTTPEndpointExpr) *AttributeExpr {
 	if a.Body != nil {
 		a.Body = DupAtt(a.Body)
 		renameType(a.Body, name, suffix)
+		if ut, ok := a.Body.Type.(*UserTypeExpr); ok {
+			ut.UID = a.Service.Name() + "#" + name
+		}
 		return a.Body
 	}
 
@@ -189,10 +192,15 @@ func httpRequestBody(a *HTTPEndpointExpr) *AttributeExpr {
 	}
 	appendSuffix(ut.Attribute().Type, suffix)
 
-	// Remember openapi typename for example to generate friendly OpenAPI specs.
 	if t, ok := payload.Type.(UserType); ok {
+		// Remember openapi typename for example to generate friendly OpenAPI specs.
 		if m, ok := t.Attribute().Meta["openapi:typename"]; ok {
-			ut.AttributeExpr.AddMeta("openapi:typename", m...)
+			ut.AddMeta("openapi:typename", m...)
+		}
+
+		// Remember additionalProperties.
+		if m, ok := t.Attribute().Meta["openapi:additionalProperties"]; ok {
+			ut.AddMeta("openapi:additionalProperties", m...)
 		}
 	}
 
@@ -219,12 +227,14 @@ func httpStreamingBody(e *HTTPEndpointExpr) *AttributeExpr {
 		return DupAtt(att)
 	}
 	const suffix = "StreamingBody"
+	dupped := DupAtt(att)
+	RemovePkgPath(dupped)
+	appendSuffix(dupped.Type, suffix)
 	ut := &UserTypeExpr{
-		AttributeExpr: DupAtt(att),
+		AttributeExpr: dupped,
 		TypeName:      concat(e.Name(), "Streaming", "Body"),
-		UID:           concat(e.Service.Name(), e.Name(), "Streaming", "Body"),
+		UID:           e.Service.Name() + "#" + e.Name() + "StreamingBody",
 	}
-	appendSuffix(ut.Attribute().Type, suffix)
 
 	return &AttributeExpr{
 		Type:         ut,
@@ -254,7 +264,7 @@ func httpResponseBody(a *HTTPEndpointExpr, resp *HTTPResponseExpr) *AttributeExp
 // parameters.
 func httpErrorResponseBody(e *HTTPEndpointExpr, v *HTTPErrorExpr) *AttributeExpr {
 	name := e.Name() + "_" + v.ErrorExpr.Name
-	return buildHTTPResponseBody(name, v.ErrorExpr.AttributeExpr, v.Response, e.Service)
+	return buildHTTPResponseBody(name, v.AttributeExpr, v.Response, e.Service)
 }
 
 func buildHTTPResponseBody(name string, attr *AttributeExpr, resp *HTTPResponseExpr, svc *HTTPServiceExpr) *AttributeExpr {
@@ -282,6 +292,12 @@ func buildHTTPResponseBody(name string, attr *AttributeExpr, resp *HTTPResponseE
 		}
 		att := DupAtt(resp.Body)
 		renameType(att, name, suffix)
+		if ut, ok := att.Type.(*UserTypeExpr); ok {
+			ut.UID = svc.Name() + "#" + name
+		}
+		if rt, ok := att.Type.(*ResultTypeExpr); ok {
+			rt.UID = svc.Name() + "#" + name
+		}
 		return att
 	}
 
@@ -325,12 +341,17 @@ func buildHTTPResponseBody(name string, attr *AttributeExpr, resp *HTTPResponseE
 		UID:           concat(svc.Name(), "#", name),
 	}
 
-	// Remember original type name and openapi typename for example
-	// to generate friendly OpenAPI specs.
 	if t, ok := attr.Type.(UserType); ok {
-		userType.AttributeExpr.AddMeta("name:original", t.Name())
+		// Remember original type name and openapi typename for example
+		// to generate friendly OpenAPI specs.
+		userType.AddMeta("name:original", t.Name())
 		if m, ok := t.Attribute().Meta["openapi:typename"]; ok {
-			userType.AttributeExpr.AddMeta("openapi:typename", m...)
+			userType.AddMeta("openapi:typename", m...)
+		}
+
+		// Remember additionalProperties.
+		if m, ok := t.Attribute().Meta["openapi:additionalProperties"]; ok {
+			userType.AddMeta("openapi:additionalProperties", m...)
 		}
 	}
 
@@ -426,6 +447,7 @@ func concat(strs ...string) string {
 }
 
 func renameType(att *AttributeExpr, name, suffix string) {
+	RemovePkgPath(att)
 	rt := att.Type
 	switch rtt := rt.(type) {
 	case UserType:

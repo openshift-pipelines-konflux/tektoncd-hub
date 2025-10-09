@@ -1,7 +1,6 @@
 package dsl
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 
@@ -146,7 +145,7 @@ const (
 //	})
 func HTTP(fns ...func()) {
 	if len(fns) > 1 {
-		eval.InvalidArgError("zero or one function", fmt.Sprintf("%d functions", len(fns)))
+		eval.TooManyArgError()
 		return
 	}
 	fn := func() {}
@@ -157,11 +156,11 @@ func HTTP(fns ...func()) {
 	case *expr.APIExpr:
 		eval.Execute(fn, expr.Root)
 	case *expr.ServiceExpr:
-		res := expr.Root.API.HTTP.ServiceFor(actual)
+		res := expr.Root.API.HTTP.ServiceFor(actual, expr.Root.API.HTTP)
 		res.DSLFunc = fn
 	case *expr.MethodExpr:
-		res := expr.Root.API.HTTP.ServiceFor(actual.Service)
-		act := res.EndpointFor(actual.Name, actual)
+		res := expr.Root.API.HTTP.ServiceFor(actual.Service, expr.Root.API.HTTP)
+		act := res.EndpointFor(actual)
 		act.DSLFunc = fn
 	default:
 		eval.IncompatibleDSL()
@@ -234,7 +233,7 @@ func Produces(args ...string) {
 // As a special case, if you want to generate a path with a trailing slash, you can use
 // GET("/./") to generate a path such as '/foo/'.
 //
-// Path must appear in a API HTTP expression or a Service HTTP expression.
+// Path must appear in an API HTTP expression or a Service HTTP expression.
 //
 // Path accepts one argument: the HTTP path prefix.
 func Path(val string) {
@@ -246,7 +245,7 @@ func Path(val string) {
 		expr.Root.API.HTTP.Path = val
 	case *expr.HTTPServiceExpr:
 		if !strings.HasPrefix(val, "//") {
-			rp := expr.Root.API.HTTP.Path
+			rp := def.Root.Path
 			awcs := expr.ExtractHTTPWildcards(rp)
 			wcs := expr.ExtractHTTPWildcards(val)
 			for _, awc := range awcs {
@@ -335,28 +334,46 @@ func PATCH(path string) *expr.RouteExpr {
 
 func route(method, path string) *expr.RouteExpr {
 	r := &expr.RouteExpr{Method: method, Path: path}
-	a, ok := eval.Current().(*expr.HTTPEndpointExpr)
-	if !ok {
+
+	switch e := eval.Current().(type) {
+	case *expr.HTTPServiceExpr:
+		// Service-level route - only allowed for JSON-RPC services
+		if e.ServiceExpr.Meta == nil || e.ServiceExpr.Meta["jsonrpc:service"] == nil {
+			eval.ReportError("routes at the service level are only allowed for JSON-RPC services. Use method-level routes instead.")
+			return r
+		}
+		// For JSON-RPC services, store the route in the service
+		e.JSONRPCRoute = r
+		return r
+
+	case *expr.HTTPEndpointExpr:
+		// Method-level route - not allowed for JSON-RPC endpoints
+		if e.IsJSONRPC() {
+			eval.ReportError("JSON-RPC endpoints cannot define routes at the method level. Define routes at the service level using JSONRPC(func() { GET(\"/path\") })")
+			return r
+		}
+		r.Endpoint = e
+		e.Routes = append(e.Routes, r)
+		return r
+
+	default:
 		eval.IncompatibleDSL()
 		return r
 	}
-	r.Endpoint = a
-	a.Routes = append(a.Routes, r)
-	return r
 }
 
 // Header describes a single HTTP header or gRPC metadata header. The properties
 // (description, type, validation etc.) of a header are inherited from the
 // request or response type attribute with the same name by default.
 //
-// Header must appear in the API HTTP expression (to define request headers
-// common to all the API endpoints), a service HTTP expression (to define
-// request headers common to all the service endpoints) a specific method HTTP
-// expression (to define request headers) or a Response expression (to define
-// the response headers). Header may also appear in a method GRPC expression (to
-// define headers sent in message metadata), or in a Response expression (to
-// define headers sent in result metadata). Finally Header may also appear in a
-// Headers expression.
+// Header must appear in the API HTTP or JSONRPC expression (to define request
+// headers common to all the API endpoints), a service HTTP or JSONRPC
+// expression (to define request headers common to all the service endpoints) a
+// specific method HTTP or JSONRPC expression (to define request headers) or a
+// Response expression (to define the response headers). Header may also appear
+// in a method GRPC expression (to define headers sent in message metadata), or
+// in a Response expression (to define headers sent in result metadata). Finally
+// Header may also appear in a Headers expression.
 //
 // Header accepts the same arguments as the Attribute function. The header name
 // may define a mapping between the attribute name and the HTTP header name when
@@ -395,11 +412,11 @@ func Header(name string, args ...any) {
 // Cookie identifies a HTTP cookie. When used within a Response the Cookie DSL
 // also makes it possible to define the cookie attributes.
 //
-// Cookie must appear in the API HTTP expression (to define request cookies
-// common to all the API endpoints), a service HTTP expression (to define
-// request cookies common to all the service endpoints) a specific method HTTP
-// expression (to define request cookies) or a Response expression (to define
-// the response cookies).
+// Cookie must appear in the API HTTP or JSONRPC expression (to define request
+// cookies common to all the API endpoints), a service HTTP or JSONRPC
+// expression (to define request cookies common to all the service endpoints) a
+// specific method HTTP or JSONRPC expression (to define request cookies) or a
+// Response expression (to define the response cookies).
 //
 // Cookie accepts the same arguments as the Attribute function. The cookie name
 // may define a mapping between the attribute name and the cookie name. The
@@ -667,6 +684,7 @@ func Params(args any) {
 // Example:
 //
 //	var ShowPayload = Type("ShowPayload", func() {
+//	    Attribute("parentID", UInt64, "ID of parent account")
 //	    Attribute("id", UInt64, "Account ID")
 //	    Attribute("version", String, "Version", func() {
 //	        Enum("1.0", "2.0")
@@ -675,8 +693,8 @@ func Params(args any) {
 //
 //	var _ = Service("account", func() {
 //	    HTTP(func() {
-//	        Path("/{parentID}")
-//	        Param("parentID", UInt64, "ID of parent account")
+//	        Path("/{parentID}") // HTTP request uses ShowPayload "parentID"
+//	        // attribute to define "parentID" parameter.
 //	    })
 //	    Method("show", func() {  // default response type.
 //	        Payload(ShowPayload)
@@ -743,7 +761,8 @@ func Param(name string, args ...any) {
 //	})
 func MapParams(args ...any) {
 	if len(args) > 1 {
-		eval.ReportError("too many arguments")
+		eval.TooManyArgError()
+		return
 	}
 	e, ok := eval.Current().(*expr.HTTPEndpointExpr)
 	if !ok {
@@ -754,7 +773,7 @@ func MapParams(args ...any) {
 	if len(args) > 0 {
 		mapName, ok = args[0].(string)
 		if !ok {
-			eval.ReportError("argument must be a string")
+			eval.InvalidArgError("string", args[0])
 		}
 	}
 	e.MapQueryParams = &mapName
@@ -894,7 +913,7 @@ func SkipResponseBodyEncodeDecode() {
 //	})
 func Body(args ...any) {
 	if len(args) == 0 {
-		eval.ReportError("not enough arguments, use Body(name), Body(type), Body(func()) or Body(type, func())")
+		eval.TooFewArgError()
 		return
 	}
 
@@ -913,7 +932,7 @@ func Body(args ...any) {
 		}
 		kind = "Request"
 	case *expr.HTTPErrorExpr:
-		ref = e.ErrorExpr.AttributeExpr
+		ref = e.AttributeExpr
 		setter = func(att *expr.AttributeExpr) {
 			if e.Response == nil {
 				e.Response = &expr.HTTPResponseExpr{}
@@ -947,6 +966,10 @@ func Body(args ...any) {
 	)
 	switch a := args[0].(type) {
 	case string:
+		if ref == nil {
+			eval.ReportError("Body is set but %s is not defined", kind)
+			return
+		}
 		if !expr.IsObject(ref.Type) {
 			eval.ReportError("%s type must be an object with an attribute with name %#v, got %T", kind, a, ref.Type)
 			return
@@ -958,16 +981,17 @@ func Body(args ...any) {
 		}
 		attr = expr.DupAtt(attr)
 		attr.AddMeta("origin:attribute", a)
-		if rt, ok := attr.Type.(*expr.ResultTypeExpr); ok {
-			// If the attribute type is a result type add the type to the
+		if rt, ok := attr.Type.(*expr.ResultTypeExpr); ok && expr.IsArray(rt.Type) {
+			// If the attribute type is a result type collection add the type to the
 			// GeneratedTypes so that the type's DSLFunc is executed.
-			*expr.Root.GeneratedTypes = append(*expr.Root.GeneratedTypes, rt)
+			expr.GeneratedResultTypes.Append(rt)
 		}
 		if len(args) > 1 {
 			var ok bool
 			fn, ok = args[1].(func())
 			if !ok {
-				eval.ReportError("second argument must be a function")
+				eval.InvalidArgError("function", args[1])
+				return
 			}
 		}
 	case expr.UserType:
@@ -976,7 +1000,8 @@ func Body(args ...any) {
 			var ok bool
 			fn, ok = args[1].(func())
 			if !ok {
-				eval.ReportError("second argument must be a function")
+				eval.InvalidArgError("function", args[1])
+				return
 			}
 		}
 	case func():
@@ -1161,7 +1186,7 @@ func cookies(exp eval.Expression) *expr.MappedAttributeExpr {
 }
 
 // params returns the mapped attribute containing the path and query params for
-// the given expression if it's either the root, a API server, a service or an
+// the given expression if it's either the root, an API server, a service or an
 // endpoint - nil otherwise.
 func params(exp eval.Expression) *expr.MappedAttributeExpr {
 	switch e := exp.(type) {

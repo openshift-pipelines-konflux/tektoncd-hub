@@ -74,8 +74,8 @@ const (
 //	})
 //
 //	var _ = Service("divider", func() {
-//	    Error("invalid_arguments") // Refers to error defined above.
-//	                               // No need to define HTTP mapping again.
+//	    Error("invalid_argument") // Refers to error defined above.
+//	                              // No need to define HTTP mapping again.
 //
 //	    // Method which uses the default type for its response.
 //	    Method("divide", func() {
@@ -173,7 +173,7 @@ func Error(name string, args ...any) {
 //	}
 func ErrorName(args ...any) {
 	if len(args) == 0 {
-		eval.IncompatibleDSL()
+		eval.TooFewArgError()
 		return
 	}
 	dsl, ok := args[len(args)-1].(func())
@@ -191,8 +191,8 @@ func ErrorName(args ...any) {
 	case string:
 		Attribute(actual, args[1:]...)
 	case int:
-		if len(args) == 1 {
-			eval.IncompatibleDSL()
+		if len(args) == 2 {
+			eval.TooFewArgError()
 			return
 		}
 		name, ok := args[1].(string)

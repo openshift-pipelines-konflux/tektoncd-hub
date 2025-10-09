@@ -7,7 +7,7 @@ import (
 )
 
 type (
-	// APIExpr contains the global properties for a API expression.
+	// APIExpr contains the global properties for an API expression.
 	APIExpr struct {
 		// DSLFunc contains the DSL used to initialize the expression.
 		eval.DSLFunc
@@ -36,10 +36,16 @@ type (
 		// potentially multiple schemes. Incoming requests must validate
 		// at least one requirement to be authorized.
 		Requirements []*SecurityExpr
+		// ClientInterceptors is the list of API client interceptors.
+		ClientInterceptors []*InterceptorExpr
+		// ServerInterceptors is the list of API server interceptors.
+		ServerInterceptors []*InterceptorExpr
 		// HTTP contains the HTTP specific API level expressions.
 		HTTP *HTTPExpr
 		// GRPC contains the gRPC specific API level expressions.
 		GRPC *GRPCExpr
+		// JSONRPC contains the JSON-RPC specific API level expressions.
+		JSONRPC *JSONRPCExpr
 
 		// random generator used to build examples for the API types.
 		ExampleGenerator *ExampleGenerator
@@ -78,6 +84,7 @@ func NewAPIExpr(name string, dsl func()) *APIExpr {
 		Name:             name,
 		HTTP:             new(HTTPExpr),
 		GRPC:             new(GRPCExpr),
+		JSONRPC:          new(JSONRPCExpr),
 		DSLFunc:          dsl,
 		ExampleGenerator: NewRandom(name),
 	}
