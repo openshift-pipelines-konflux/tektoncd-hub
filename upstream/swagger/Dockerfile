@@ -1,4 +1,4 @@
-FROM node:18-alpine3.16 as BUILD
+FROM node:20-alpine3.16 as BUILD
 WORKDIR /app
 
 # install deps and the copy the src to speed up docker build
