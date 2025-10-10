@@ -72,7 +72,7 @@ import (
 //	})
 func Result(val any, args ...any) {
 	if len(args) > 2 {
-		eval.ReportError("too many arguments")
+		eval.TooManyArgError()
 		return
 	}
 	e, ok := eval.Current().(*expr.MethodExpr)
@@ -88,6 +88,12 @@ func Result(val any, args ...any) {
 // StreamingResult must appear in a Method expression.
 //
 // The arguments to a StreamingResult DSL is same as the Result DSL.
+//
+// StreamingResult requires a transport that supports server-to-client streaming.
+// This includes gRPC, WebSockets, and Server-Sent Events (SSE). When using
+// HTTP transports, SSE (via POST endpoints) is recommended for server-to-client
+// only streaming, while WebSockets (via GET endpoints) are required for
+// bidirectional streaming.
 //
 // Examples:
 //
@@ -128,9 +134,31 @@ func Result(val any, args ...any) {
 //	        Required("value")
 //	    })
 //	})
+//
+//	// Method with SSE streaming
+//	Method("events", func() {
+//	    Payload(func() {
+//	        Attribute("channel", String)
+//	        Required("channel")
+//	    })
+//	    StreamingResult(Event)
+//	    HTTP(func() {
+//	        POST("/events")
+//	        ServerSentEvents()
+//	    })
+//	})
+//
+//	// Method with WebSocket streaming (bidirectional)
+//	Method("chat", func() {
+//	    StreamingPayload(Message)
+//	    StreamingResult(Message)
+//	    HTTP(func() {
+//	        GET("/chat")
+//	    })
+//	})
 func StreamingResult(val any, args ...any) {
 	if len(args) > 2 {
-		eval.ReportError("too many arguments")
+		eval.TooManyArgError()
 		return
 	}
 	e, ok := eval.Current().(*expr.MethodExpr)
@@ -138,7 +166,7 @@ func StreamingResult(val any, args ...any) {
 		eval.IncompatibleDSL()
 		return
 	}
-	e.Result = methodDSL(e, "Result", val, args...)
+	e.StreamingResult = methodDSL(e, "StreamingResult", val, args...)
 	if e.Stream == expr.ClientStreamKind {
 		e.Stream = expr.BidirectionalStreamKind
 	} else {
