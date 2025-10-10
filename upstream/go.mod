@@ -10,7 +10,7 @@ require (
 	github.com/Netflix/go-expect v0.0.0-20220104043353-73e0943537d2
 	github.com/fatih/color v1.18.0
 	github.com/go-co-op/gocron v1.37.0
-	github.com/go-gormigrate/gormigrate/v2 v2.1.3
+	github.com/go-gormigrate/gormigrate/v2 v2.1.5
 	github.com/go-testfixtures/testfixtures/v3 v3.13.0
 	github.com/golang-jwt/jwt v3.2.2+incompatible
 	github.com/gorilla/handlers v1.5.2
@@ -34,7 +34,7 @@ require (
 	golang.org/x/text v0.22.0
 	gopkg.in/h2non/gock.v1 v1.1.2
 	gorm.io/driver/postgres v1.5.2
-	gorm.io/gorm v1.25.12
+	gorm.io/gorm v1.26.1
 	gotest.tools/v3 v3.5.1
 	k8s.io/apimachinery v0.29.10
 	k8s.io/client-go v0.29.10
