@@ -58,7 +58,7 @@ var (
 //	})
 func Type(name string, args ...any) expr.UserType {
 	if len(args) > 2 {
-		eval.ReportError("too many arguments")
+		eval.TooManyArgError()
 		return nil
 	}
 	if t := expr.Root.UserType(name); t != nil {
@@ -85,7 +85,7 @@ func Type(name string, args ...any) expr.UserType {
 		if len(args) == 2 {
 			d, ok := args[1].(func())
 			if !ok {
-				eval.ReportError("third argument must be a function")
+				eval.InvalidArgError("function", args[1])
 				return nil
 			}
 			fn = d
@@ -94,7 +94,7 @@ func Type(name string, args ...any) expr.UserType {
 		base = &expr.Object{}
 		fn = a
 		if len(args) == 2 {
-			eval.ReportError("only one argument allowed when it is a function")
+			eval.TooManyArgError()
 			return nil
 		}
 	default:
@@ -103,8 +103,12 @@ func Type(name string, args ...any) expr.UserType {
 	}
 
 	t := &expr.UserTypeExpr{
-		TypeName:      name,
-		AttributeExpr: &expr.AttributeExpr{Type: base, DSLFunc: fn},
+		TypeName: name,
+		AttributeExpr: &expr.AttributeExpr{
+			Type:    base,
+			DSLFunc: fn,
+			Meta:    expr.MetaExpr{"openapi:typename": []string{name}},
+		},
 	}
 	expr.Root.Types = append(expr.Root.Types, t)
 	return t
@@ -149,7 +153,7 @@ func ArrayOf(v any, fn ...func()) *expr.Array {
 		return &expr.Array{ElemType: &expr.AttributeExpr{Type: expr.String}}
 	}
 	if len(fn) > 1 {
-		eval.ReportError("ArrayOf: too many arguments")
+		eval.TooManyArgError()
 		return &expr.Array{ElemType: &expr.AttributeExpr{Type: expr.String}}
 	}
 	at := expr.AttributeExpr{Type: t}
@@ -203,7 +207,7 @@ func MapOf(k, v any, fn ...func()) *expr.Map {
 		return &expr.Map{KeyType: &expr.AttributeExpr{Type: expr.String}, ElemType: &expr.AttributeExpr{Type: expr.String}}
 	}
 	if len(fn) > 1 {
-		eval.ReportError("MapOf: too many arguments")
+		eval.TooManyArgError()
 		return &expr.Map{KeyType: &expr.AttributeExpr{Type: expr.String}, ElemType: &expr.AttributeExpr{Type: expr.String}}
 	}
 	kat := expr.AttributeExpr{Type: tk}

@@ -1,6 +1,7 @@
 package expr
 
 import (
+	"errors"
 	"fmt"
 
 	"goa.design/goa/v3/eval"
@@ -26,6 +27,10 @@ type (
 		// potentially multiple schemes. Incoming requests must validate
 		// at least one requirement to be authorized.
 		Requirements []*SecurityExpr
+		// ClientInterceptors is the list of client interceptors.
+		ClientInterceptors []*InterceptorExpr
+		// ServerInterceptors is the list of server interceptors.
+		ServerInterceptors []*InterceptorExpr
 		// Meta is a set of key/value pairs with semantic that is
 		// specific to each generator.
 		Meta MetaExpr
@@ -80,7 +85,8 @@ func (s *ServiceExpr) Validate() error {
 	verr := new(eval.ValidationErrors)
 	for _, e := range s.Errors {
 		if err := e.Validate(); err != nil {
-			if verrs, ok := err.(*eval.ValidationErrors); ok {
+			var verrs *eval.ValidationErrors
+			if errors.As(err, &verrs) {
 				verr.Merge(verrs)
 			}
 		}
@@ -103,14 +109,14 @@ func (e *ErrorExpr) Validate() error {
 	walkAttribute(e.AttributeExpr, func(name string, att *AttributeExpr) error { // nolint: errcheck
 		if _, ok := att.Meta["struct:error:name"]; ok {
 			if errField != "" {
-				verr.Add(e, "duplicate error names in type %q", e.AttributeExpr.Type.Name())
+				verr.Add(e, "duplicate error names in type %q", e.Type.Name())
 			}
 			errField = name
 			if att.Type != String {
-				verr.Add(e, "error name %q must be a string in type %q", name, e.AttributeExpr.Type.Name())
+				verr.Add(e, "error name %q must be a string in type %q", name, e.Type.Name())
 			}
-			if !e.AttributeExpr.IsRequired(name) {
-				verr.Add(e, "error name %q must be required in type %q", name, e.AttributeExpr.Type.Name())
+			if !e.IsRequired(name) {
+				verr.Add(e, "error name %q must be required in type %q", name, e.Type.Name())
 			}
 		}
 		return nil

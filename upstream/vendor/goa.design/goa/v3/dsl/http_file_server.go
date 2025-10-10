@@ -49,7 +49,7 @@ import (
 //	})
 func Files(path, filename string, fns ...func()) {
 	if len(fns) > 1 {
-		eval.ReportError("too many arguments given to Files")
+		eval.TooManyArgError()
 		return
 	}
 	// Make sure request path starts with a "/" so codegen can rely on it.
@@ -61,7 +61,7 @@ func Files(path, filename string, fns ...func()) {
 		eval.IncompatibleDSL()
 		return
 	}
-	r := expr.Root.API.HTTP.ServiceFor(s)
+	r := expr.Root.API.HTTP.ServiceFor(s, expr.Root.API.HTTP)
 	server := &expr.HTTPFileServerExpr{
 		Service:      r,
 		RequestPaths: []string{path},

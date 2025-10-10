@@ -11,7 +11,9 @@
 	{
 	{{- range .Services }}
 		{{- if .Methods }}
-			{{ .VarName }}Endpoints = {{ .PkgName }}.NewEndpoints({{ .VarName }}Svc)
+			{{ .VarName }}Endpoints = {{ .PkgName }}.NewEndpoints({{ .VarName }}Svc{{ if .ServerInterceptors }}, {{ .VarName }}Interceptors{{ end }})
+			{{ .VarName }}Endpoints.Use(debug.LogPayloads())
+			{{ .VarName }}Endpoints.Use(log.Endpoint)
 		{{- end }}
 	{{- end }}
 	}
