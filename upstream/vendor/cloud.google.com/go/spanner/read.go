@@ -28,6 +28,8 @@ import (
 	"cloud.google.com/go/internal/trace"
 	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/googleapis/gax-go/v2"
+	otcodes "go.opentelemetry.io/otel/codes"
+	otrace "go.opentelemetry.io/otel/trace"
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -39,6 +41,7 @@ import (
 // stream.
 type streamingReceiver interface {
 	Recv() (*sppb.PartialResultSet, error)
+	Context() context.Context
 }
 
 // errEarlyReadEnd returns error for read finishes when gRPC stream is still
@@ -53,9 +56,10 @@ func stream(
 	ctx context.Context,
 	logger *log.Logger,
 	meterTracerFactory *builtinMetricsTracerFactory,
-	rpc func(ct context.Context, resumeToken []byte) (streamingReceiver, error),
+	rpc func(ct context.Context, resumeToken []byte, opts ...gax.CallOption) (streamingReceiver, error),
 	setTimestamp func(time.Time),
 	release func(error),
+	gsc *grpcSpannerClient,
 ) *RowIterator {
 	return streamWithReplaceSessionFunc(
 		ctx,
@@ -67,8 +71,10 @@ func stream(
 		func(err error) error {
 			return err
 		},
+		nil,
 		setTimestamp,
 		release,
+		gsc,
 	)
 }
 
@@ -79,24 +85,27 @@ func streamWithReplaceSessionFunc(
 	ctx context.Context,
 	logger *log.Logger,
 	meterTracerFactory *builtinMetricsTracerFactory,
-	rpc func(ct context.Context, resumeToken []byte) (streamingReceiver, error),
+	rpc func(ct context.Context, resumeToken []byte, opts ...gax.CallOption) (streamingReceiver, error),
 	replaceSession func(ctx context.Context) error,
 	setTransactionID func(transactionID),
 	updateTxState func(err error) error,
+	updatePrecommitToken func(token *sppb.MultiplexedSessionPrecommitToken),
 	setTimestamp func(time.Time),
 	release func(error),
+	gsc *grpcSpannerClient,
 ) *RowIterator {
 	ctx, cancel := context.WithCancel(ctx)
-	ctx = trace.StartSpan(ctx, "cloud.google.com/go/spanner.RowIterator")
+	ctx, _ = startSpan(ctx, "RowIterator")
 	return &RowIterator{
-		meterTracerFactory: meterTracerFactory,
-		streamd:            newResumableStreamDecoder(ctx, logger, rpc, replaceSession),
-		rowd:               &partialResultSetDecoder{},
-		setTransactionID:   setTransactionID,
-		updateTxState:      updateTxState,
-		setTimestamp:       setTimestamp,
-		release:            release,
-		cancel:             cancel,
+		meterTracerFactory:   meterTracerFactory,
+		streamd:              newResumableStreamDecoder(ctx, cancel, logger, rpc, replaceSession, gsc),
+		rowd:                 &partialResultSetDecoder{},
+		setTransactionID:     setTransactionID,
+		updatePrecommitToken: updatePrecommitToken,
+		updateTxState:        updateTxState,
+		setTimestamp:         setTimestamp,
+		release:              release,
+		cancel:               cancel,
 	}
 }
 
@@ -127,18 +136,19 @@ type RowIterator struct {
 	// RowIterator.Next() returned an error that is not equal to iterator.Done.
 	Metadata *sppb.ResultSetMetadata
 
-	ctx                context.Context
-	meterTracerFactory *builtinMetricsTracerFactory
-	streamd            *resumableStreamDecoder
-	rowd               *partialResultSetDecoder
-	setTransactionID   func(transactionID)
-	updateTxState      func(err error) error
-	setTimestamp       func(time.Time)
-	release            func(error)
-	cancel             func()
-	err                error
-	rows               []*Row
-	sawStats           bool
+	ctx                  context.Context
+	meterTracerFactory   *builtinMetricsTracerFactory
+	streamd              *resumableStreamDecoder
+	rowd                 *partialResultSetDecoder
+	setTransactionID     func(transactionID)
+	updateTxState        func(err error) error
+	updatePrecommitToken func(token *sppb.MultiplexedSessionPrecommitToken)
+	setTimestamp         func(time.Time)
+	release              func(error)
+	cancel               func()
+	err                  error
+	rows                 []*Row
+	sawStats             bool
 }
 
 // this is for safety from future changes to RowIterator making sure that it implements rowIterator interface.
@@ -184,10 +194,13 @@ func (r *RowIterator) Next() (*Row, error) {
 				// if request contains TransactionSelector::Begin option, this is here as fallback to retry with
 				// explicit transactionID after a retry.
 				r.setTransactionID(nil)
-				r.err = errInlineBeginTransactionFailed()
+				r.err = r.updateTxState(errInlineBeginTransactionFailed(nil))
 				return nil, r.err
 			}
 			r.setTransactionID = nil
+		}
+		if r.updatePrecommitToken != nil {
+			r.updatePrecommitToken(prs.GetPrecommitToken())
 		}
 		if prs.Stats != nil {
 			r.sawStats = true
@@ -224,6 +237,7 @@ func (r *RowIterator) Next() (*Row, error) {
 	} else if !r.rowd.done() {
 		r.err = errEarlyReadEnd()
 	} else {
+		r.cancel = nil
 		r.err = iterator.Done
 	}
 	return nil, r.err
@@ -391,11 +405,14 @@ type resumableStreamDecoder struct {
 	// ctx is the caller's context, used for cancel/timeout Next().
 	ctx context.Context
 
+	// cancel is the function to cancel the context
+	cancel func()
+
 	// rpc is a factory of streamingReceiver, which might resume
 	// a previous stream from the point encoded in restartToken.
 	// rpc is always a wrapper of a Cloud Spanner query which is
 	// resumable.
-	rpc func(ctx context.Context, restartToken []byte) (streamingReceiver, error)
+	rpc func(ctx context.Context, restartToken []byte, opts ...gax.CallOption) (streamingReceiver, error)
 
 	// replaceSessionFunc is a function that can be used to replace the session
 	// that is being used to execute the read operation. This function should
@@ -437,20 +454,39 @@ type resumableStreamDecoder struct {
 
 	// backoff is used for the retry settings
 	backoff gax.Backoff
+
+	gsc *grpcSpannerClient
+
+	// reqIDInjector is generated once per stream, unless the stream
+	// gets broken and in that case a fresh one is generated.
+	reqIDInjector *requestIDWrap
+	// retryAttempt is is incremented whenever a retry happens, and it is
+	// reset whenever a new reqIDInjector is created afresh.
+	retryAttempt uint32
 }
 
 // newResumableStreamDecoder creates a new resumeableStreamDecoder instance.
 // Parameter rpc should be a function that creates a new stream beginning at the
 // restartToken if non-nil.
-func newResumableStreamDecoder(ctx context.Context, logger *log.Logger, rpc func(ct context.Context, restartToken []byte) (streamingReceiver, error), replaceSession func(ctx context.Context) error) *resumableStreamDecoder {
+func newResumableStreamDecoder(ctx context.Context, cancel func(), logger *log.Logger, rpc func(ct context.Context, restartToken []byte, opts ...gax.CallOption) (streamingReceiver, error), replaceSession func(ctx context.Context) error, gsc *grpcSpannerClient) *resumableStreamDecoder {
 	return &resumableStreamDecoder{
 		ctx:                         ctx,
+		cancel:                      cancel,
 		logger:                      logger,
 		rpc:                         rpc,
 		replaceSessionFunc:          replaceSession,
 		maxBytesBetweenResumeTokens: atomic.LoadInt32(&maxBytesBetweenResumeTokens),
 		backoff:                     DefaultRetryBackoff,
+		gsc:                         gsc,
 	}
+}
+
+func (d *resumableStreamDecoder) reqIDInjectorOrNew() *requestIDWrap {
+	if d.reqIDInjector == nil {
+		d.reqIDInjector = d.gsc.generateRequestIDHeaderInjector()
+		d.retryAttempt = 0
+	}
+	return d.reqIDInjector
 }
 
 // changeState fulfills state transition for resumableStateDecoder.
@@ -533,11 +569,16 @@ var (
 
 func (d *resumableStreamDecoder) next(mt *builtinMetricsTracer) bool {
 	retryer := onCodes(d.backoff, codes.Unavailable, codes.ResourceExhausted, codes.Internal)
+
+	// Setup and track x-goog-request-id in the manual retries for ExecuteStreamingSql.
+	riw := d.reqIDInjectorOrNew()
+
 	for {
 		switch d.state {
 		case unConnected:
+			d.retryAttempt++
 			// If no gRPC stream is available, try to initiate one.
-			d.stream, d.err = d.rpc(context.WithValue(d.ctx, metricsTracerKey, mt), d.resumeToken)
+			d.stream, d.err = d.rpc(context.WithValue(d.ctx, metricsTracerKey, mt), d.resumeToken, riw.withNextRetryAttempt(d.retryAttempt))
 			if d.err == nil {
 				d.changeState(queueingRetryable)
 				continue
@@ -615,6 +656,7 @@ func (d *resumableStreamDecoder) next(mt *builtinMetricsTracer) bool {
 			return false
 		case finished:
 			// If query has finished, check if there are still buffered messages.
+			d.reqIDInjector = nil
 			if d.q.empty() {
 				// No buffered PartialResultSet.
 				return false
@@ -637,6 +679,23 @@ func (d *resumableStreamDecoder) tryRecv(mt *builtinMetricsTracer, retryer gax.R
 	res, d.err = d.stream.Recv()
 	if d.err == nil {
 		d.q.push(res)
+		if res.GetLast() {
+			if span := otrace.SpanFromContext(d.stream.Context()); span != nil && span.IsRecording() {
+				span.SetStatus(otcodes.Ok, "Stream finished successfully")
+				span.End()
+			}
+			if d.cancel != nil {
+				// Remove the cancel function to prevent iter.Stop from also calling it.
+				cancel := d.cancel
+				d.cancel = nil
+				go func() {
+					_, _ = d.stream.Recv()
+					cancel()
+				}()
+			}
+			d.changeState(finished)
+			return
+		}
 		if d.state == queueingRetryable && !d.isNewResumeToken(res.ResumeToken) {
 			d.bytesBetweenResumeTokens += int32(proto.Size(res))
 		}
@@ -646,6 +705,10 @@ func (d *resumableStreamDecoder) tryRecv(mt *builtinMetricsTracer, retryer gax.R
 
 	if d.err == io.EOF {
 		d.err = nil
+		// Cancel the context after receiving trailers
+		if d.cancel != nil {
+			d.cancel()
+		}
 		d.changeState(finished)
 		return
 	}
