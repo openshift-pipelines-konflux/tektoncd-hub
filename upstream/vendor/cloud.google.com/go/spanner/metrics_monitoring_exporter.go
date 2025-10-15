@@ -24,11 +24,14 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
 	monitoring "cloud.google.com/go/monitoring/apiv3/v2"
 	"cloud.google.com/go/monitoring/apiv3/v2/monitoringpb"
+	"cloud.google.com/go/spanner/internal"
+	"github.com/googleapis/gax-go/v2/callctx"
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/sdk/metric"
 	otelmetricdata "go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -36,6 +39,9 @@ import (
 	"google.golang.org/genproto/googleapis/api/distribution"
 	googlemetricpb "google.golang.org/genproto/googleapis/api/metric"
 	monitoredrespb "google.golang.org/genproto/googleapis/api/monitoredres"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/encoding/gzip"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -57,6 +63,18 @@ var (
 		monitoredResLabelKeyClientHash:     true,
 	}
 
+	allowedMetricLabels = map[string]bool{
+		metricLabelKeyGRPCLBPickResult:      true,
+		metricLabelKeyGRPCLBDataPlaneTarget: true,
+		metricLabelKeyClientUID:             true,
+		metricLabelKeyClientName:            true,
+		metricLabelKeyDatabase:              true,
+		metricLabelKeyDirectPathEnabled:     true,
+		metricLabelKeyDirectPathUsed:        true,
+		metricLabelKeyMethod:                true,
+		metricLabelKeyStatus:                true,
+	}
+
 	errShutdown = fmt.Errorf("exporter is shutdown")
 )
 
@@ -72,22 +90,40 @@ func (e errUnexpectedAggregationKind) Error() string {
 // Google Cloud Monitoring.
 // Default exporter for built-in metrics
 type monitoringExporter struct {
-	shutdown     chan struct{}
-	client       *monitoring.MetricClient
-	shutdownOnce sync.Once
-	projectID    string
+	projectID        string
+	compression      string
+	clientAttributes []attribute.KeyValue
+	shutdown         chan struct{}
+	client           *monitoring.MetricClient
+	shutdownOnce     sync.Once
+
+	mu             sync.Mutex
+	stopExport     bool
+	lastExportedAt time.Time
 }
 
-func newMonitoringExporter(ctx context.Context, project string, opts ...option.ClientOption) (*monitoringExporter, error) {
+func newMonitoringExporter(ctx context.Context, project, compression string, clientAttributes []attribute.KeyValue, opts ...option.ClientOption) (*monitoringExporter, error) {
 	client, err := monitoring.NewMetricClient(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return &monitoringExporter{
-		client:    client,
-		shutdown:  make(chan struct{}),
-		projectID: project,
+		projectID:        project,
+		compression:      compression,
+		clientAttributes: clientAttributes,
+		lastExportedAt:   time.Now().Add(-time.Minute),
+		client:           client,
+		shutdown:         make(chan struct{}),
 	}, nil
+}
+
+func (me *monitoringExporter) stop() {
+	// stop the exporter if last export happens within half-time of default sample period
+	me.mu.Lock()
+	defer me.mu.Unlock()
+	if time.Since(me.lastExportedAt) <= (defaultSamplePeriod / 2) {
+		me.stopExport = true
+	}
 }
 
 // ForceFlush does nothing, the exporter holds no state.
@@ -111,6 +147,12 @@ func (me *monitoringExporter) Export(ctx context.Context, rm *otelmetricdata.Res
 	default:
 	}
 
+	me.mu.Lock()
+	if me.stopExport {
+		me.mu.Unlock()
+		return nil
+	}
+	me.mu.Unlock()
 	return me.exportTimeSeries(ctx, rm)
 }
 
@@ -131,23 +173,34 @@ func (me *monitoringExporter) exportTimeSeries(ctx context.Context, rm *otelmetr
 	if len(tss) == 0 {
 		return err
 	}
-
 	name := fmt.Sprintf("projects/%s", me.projectID)
-
+	ctx = callctx.SetHeaders(ctx, "x-goog-api-client", "gccl/"+internal.Version)
+	if me.compression == gzip.Name {
+		ctx = callctx.SetHeaders(ctx, requestsCompressionHeader, gzip.Name)
+	}
 	errs := []error{err}
 	for i := 0; i < len(tss); i += sendBatchSize {
 		j := i + sendBatchSize
 		if j >= len(tss) {
 			j = len(tss)
 		}
-
 		req := &monitoringpb.CreateTimeSeriesRequest{
 			Name:       name,
 			TimeSeries: tss[i:j],
 		}
-		errs = append(errs, me.client.CreateServiceTimeSeries(ctx, req))
+		err = me.client.CreateServiceTimeSeries(ctx, req)
+		if err != nil {
+			if status.Code(err) == codes.PermissionDenied {
+				err = fmt.Errorf("%w Need monitoring metric writer permission on project=%s. Follow https://cloud.google.com/spanner/docs/view-manage-client-side-metrics#access-client-side-metrics to set up permissions",
+					err, me.projectID)
+			}
+		}
+		errs = append(errs, err)
 	}
 
+	me.mu.Lock()
+	me.lastExportedAt = time.Now()
+	me.mu.Unlock()
 	return errors.Join(errs...)
 }
 
@@ -162,21 +215,32 @@ func (me *monitoringExporter) recordToMetricAndMonitoredResourcePbs(metrics otel
 		iter := attr.Iter()
 		for iter.Next() {
 			kv := iter.Attribute()
-			labelKey := string(kv.Key)
-
+			// Replace metric label names by converting "." to "_" since Cloud Monitoring does not
+			// support labels containing "."
+			labelKey := strings.Replace(string(kv.Key), ".", "_", -1)
 			if _, isResLabel := monitoredResLabelsSet[labelKey]; isResLabel {
-				// Add labels to monitored resource
 				mr.Labels[labelKey] = kv.Value.Emit()
 			} else {
-				// Add labels to metric
-				labels[labelKey] = kv.Value.Emit()
-
+				if _, ok := allowedMetricLabels[string(kv.Key)]; ok {
+					labels[labelKey] = kv.Value.Emit()
+				}
+			}
+		}
+		for _, label := range me.clientAttributes {
+			if _, isResLabel := monitoredResLabelsSet[string(label.Key)]; isResLabel {
+				mr.Labels[string(label.Key)] = label.Value.Emit()
+			} else {
+				labels[string(label.Key)] = label.Value.Emit()
 			}
 		}
 	}
+	metricName := metrics.Name
+	if !strings.HasPrefix(metricName, nativeMetricsPrefix) {
+		metricName = nativeMetricsPrefix + strings.Replace(metricName, ".", "/", -1)
+	}
 	addAttributes(&attributes)
 	return &googlemetricpb.Metric{
-		Type:   metrics.Name,
+		Type:   metricName,
 		Labels: labels,
 	}, mr
 }
@@ -187,8 +251,7 @@ func (me *monitoringExporter) recordsToTimeSeriesPbs(rm *otelmetricdata.Resource
 		errs []error
 	)
 	for _, scope := range rm.ScopeMetrics {
-		if scope.Scope.Name != builtInMetricsMeterName {
-			// Filter out metric data for instruments that are not part of the spanner builtin metrics
+		if !(scope.Scope.Name == builtInMetricsMeterName || scope.Scope.Name == grpcMetricMeterName) {
 			continue
 		}
 		for _, metrics := range scope.Metrics {
