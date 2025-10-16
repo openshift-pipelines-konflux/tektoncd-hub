@@ -282,14 +282,14 @@ github.com/hashicorp/golang-lru/simplelru
 # github.com/ikawaha/goahttpcheck v1.15.11
 ## explicit; go 1.23.0
 github.com/ikawaha/goahttpcheck
-# github.com/ikawaha/httpcheck v1.12.4
-## explicit; go 1.19
+# github.com/ikawaha/httpcheck v1.12.5
+## explicit; go 1.21.0
 github.com/ikawaha/httpcheck
 # github.com/inconshreveable/mousetrap v1.1.0
 ## explicit; go 1.18
 github.com/inconshreveable/mousetrap
-# github.com/itchyny/gojq v0.12.16
-## explicit; go 1.20
+# github.com/itchyny/gojq v0.12.17
+## explicit; go 1.21
 github.com/itchyny/gojq
 # github.com/itchyny/timefmt-go v0.1.6
 ## explicit; go 1.20
@@ -496,7 +496,7 @@ github.com/spf13/viper/internal/features
 # github.com/stoewer/go-strcase v1.3.0
 ## explicit; go 1.11
 github.com/stoewer/go-strcase
-# github.com/stretchr/testify v1.10.0
+# github.com/stretchr/testify v1.11.1
 ## explicit; go 1.17
 github.com/stretchr/testify/assert
 github.com/stretchr/testify/assert/yaml
