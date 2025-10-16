@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.18.0 - 2025-08-24
+- feat: use go.work to reduce core library dependencies([#257](https://github.com/go-testfixtures/testfixtures/pull/257) by @slsyy)
+- docs: add automatic string conversion documentation ([#318](https://github.com/go-testfixtures/testfixtures/pull/318) by @alingse)
+
+## v3.17.0 - 2025-07-14
+- feat: make placeholder configurable regardless of dialect ([#305](https://github.com/go-testfixtures/testfixtures/pull/305) by @levopmik and @peakle)
+- feat: support spanner json columns ([#309](https://github.com/go-testfixtures/testfixtures/pull/309) by @nu0ma)
+- Updated dependencies.
+
 ## v3.16.0 - 2025-05-25
 - feat: migrate from gopkg.in/yaml.v3 to github.com/goccy/go-yaml ([#290](https://github.com/go-testfixtures/testfixtures/pull/290) by @tomnewton)
 - feat: add support for interleaved tables in spanner ([#290](https://github.com/go-testfixtures/testfixtures/pull/290) by @tomnewton)
