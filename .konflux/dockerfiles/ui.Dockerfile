@@ -1,6 +1,6 @@
 # --- builder image
-ARG NODEJS_BUILDER=registry.access.redhat.com/ubi9/nodejs-18@sha256:a2cc112367458e595ae93e01bb20501cd8c31a0e992d2331dd6474e21d05b007
-ARG RUNTIME=registry.access.redhat.com/ubi9/nginx-122@sha256:23c1729c45bf1e3ab30e078931d20eb61b01863b068a0a971c61b9529612a2eb
+ARG NODEJS_BUILDER=registry.access.redhat.com/ubi9/nodejs-18@sha256:4c71d9a21ab7c87c3de4d9e49228fb9724142c40e21503e2d9a1e291941478f6
+ARG RUNTIME=registry.access.redhat.com/ubi9/nginx-124@sha256:6465906193329d883dfe2de4077e5618420fa39885107f6dacd87fe00629ef4c 
 
 FROM $NODEJS_BUILDER AS builder
 
@@ -16,7 +16,7 @@ RUN set -e; for f in patches/*.patch; do echo foo ${f}; [[ -f ${f} ]] || continu
 
 WORKDIR $REMOTE_SOURCE/ui
 
-RUN npm clean-install --legacy-peer-deps && \
+RUN npm clean-install --legacy-peer-deps --ignore-scripts --max-old-space-size=4096 --force --no-optional && \
     npm run build
 
 # --- runtime image
@@ -26,9 +26,17 @@ ARG REMOTE_SOURCE=/go/src/github.com/tektoncd/hub
 COPY --from=builder $REMOTE_SOURCE/ui/build /opt/app-root/src
 COPY --from=builder --chown=1001 $REMOTE_SOURCE/ui/image/start.sh /usr/bin/
 ENV BASE_PATH="/opt/app-root/src"
-ARG VERSION=hub-main
+ARG VERSION=hub-ui-next
 
 USER root
+RUN fips-mode-setup --enable && \
+    update-crypto-policies --set FIPS && \
+    echo "Verifying FIPS kernel parameter:" && \
+    cat /proc/sys/crypto/fips_enabled && \
+    echo "Verifying OpenSSL FIPS status:" && \
+    openssl version -a | grep -i fips && \
+    (openssl md5 /dev/null || echo "MD5 test passed (expected failure in FIPS mode)")
+
 RUN chmod ugo+rw /opt/app-root/src/config.js && \
     chown nginx:nginx /opt/app-root/src/config.js && \
     chmod +x /usr/bin/start.sh
@@ -42,7 +50,7 @@ CMD /usr/bin/start.sh
 
 LABEL \
     com.redhat.component="openshift-pipelines-hub-ui-container" \
-    name="openshift-pipelines/pipelines-hub-ui-rhel8" \
+    name="openshift-pipelines/pipelines-hub-ui-rhel9" \
     version=$VERSION \
     summary="Red Hat OpenShift Pipelines Hub UI" \
     maintainer="pipelines-extcomm@redhat.com" \

@@ -1,5 +1,5 @@
-ARG GO_BUILDER=brew.registry.redhat.io/rh-osbs/openshift-golang-builder:v1.22
-ARG RUNTIME=registry.access.redhat.com/ubi9/ubi-minimal:latest@sha256:14f14e03d68f7fd5f2b18a13478b6b127c341b346c86b6e0b886ed2b7573b8e0
+ARG GO_BUILDER=brew.registry.redhat.io/rh-osbs/openshift-golang-builder:v1.24
+ARG RUNTIME=registry.access.redhat.com/ubi9/ubi-minimal:latest@sha256:2f06ae0e6d3d9c4f610d32c480338eef474867f435d8d28625f2985e8acde6e8
 
 FROM $GO_BUILDER AS builder
 
@@ -11,11 +11,12 @@ RUN set -e; for f in patches/*.patch; do echo ${f}; [[ -f ${f} ]] || continue; g
 COPY head HEAD
 
 ENV GODEBUG="http2server=0"
-RUN go build -ldflags="-X 'knative.dev/pkg/changeset.rev=$(cat HEAD)'" -mod=vendor -tags disable_gcp -v -o /tmp/hub-db-migration \
+ENV GOEXPERIMENT=strictfipsruntime
+RUN go build -ldflags="-X 'knative.dev/pkg/changeset.rev=$(cat HEAD)'" -mod=vendor -tags disable_gcp,strictfipsruntime -v -o /tmp/hub-db-migration \
     ./api/cmd/db
 
 FROM $RUNTIME
-ARG VERSION=hub-main
+ARG VERSION=hub-db-next
 
 COPY --from=builder /tmp/hub-db-migration /ko-app/hub-db-migration
 COPY head ${KO_DATA_PATH}/HEAD
@@ -24,7 +25,7 @@ EXPOSE 8000
 
 LABEL \
     com.redhat.component="openshift-pipelines-hub-db-migration-container" \
-    name="openshift-pipelines/pipelines-hub-db-migration-rhel8" \
+    name="openshift-pipelines/pipelines-hub-db-migration-rhel9" \
     version=$VERSION \
     summary="Red Hat OpenShift Pipelines Hub DB Migration" \
     maintainer="pipelines-extcomm@redhat.com" \
