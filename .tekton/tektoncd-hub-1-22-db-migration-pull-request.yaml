@@ -4,22 +4,22 @@ kind: PipelineRun
 metadata:
   annotations:
     pipelinesascode.tekton.dev/cancel-in-progress: "true" # Cancel in-progress pipelines
-    pipelinesascode.tekton.dev/pipeline: "https://raw.githubusercontent.com/openshift-pipelines-konflux/tektoncd-operator/refs/heads/main/.tekton/docker-build-ta.yaml"
+    pipelinesascode.tekton.dev/pipeline: "https://raw.githubusercontent.com/openshift-pipelines/operator/refs/heads/main/.tekton/docker-build-ta.yaml"
     build.appstudio.openshift.io/repo: https://github.com/openshift-pipelines-konflux/tektoncd-hub.git?rev={{revision}}
     build.appstudio.redhat.com/commit_sha: '{{revision}}'
     build.appstudio.redhat.com/pull_request_number: '{{pull_request_number}}'
     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
     pipelinesascode.tekton.dev/max-keep-runs: "3"
     pipelinesascode.tekton.dev/on-cel-expression: event == "pull_request" && target_branch
-      == "main" &&
+      == "release-v1.22.x" &&
       ("upstream/***".pathChanged() || ".konflux/patches/***".pathChanged() || ".konflux/rpms/***".pathChanged() ||
       ".konflux/dockerfiles/db-migration.Dockerfile".pathChanged() ||
-      ".tekton/tektoncd-hub-main-db-migration-pull-request.yaml".pathChanged())
+      ".tekton/tektoncd-hub-1-22-db-migration-pull-request.yaml".pathChanged())
   labels:
-    appstudio.openshift.io/application: openshift-pipelines-core-main
-    appstudio.openshift.io/component: tektoncd-hub-main-db-migration
+    appstudio.openshift.io/application: openshift-pipelines-core-1-22
+    appstudio.openshift.io/component: tektoncd-hub-1-22-db-migration
     pipelines.appstudio.openshift.io/type: build
-  name: tektoncd-hub-main-db-migration-on-pull-request
+  name: tektoncd-hub-1-22-db-migration-on-pull-request
   namespace: tekton-ecosystem-tenant
 spec:
   params:
@@ -42,7 +42,7 @@ spec:
   pipelineRef:
     name: docker-build-ta
   taskRunTemplate:
-    serviceAccountName: build-pipeline-tektoncd-hub-main-db-migration
+    serviceAccountName: build-pipeline-tektoncd-hub-db-migration-1-22
   workspaces:
   - name: git-auth
     secret:
