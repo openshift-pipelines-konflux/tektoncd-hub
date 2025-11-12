@@ -4,23 +4,23 @@ kind: PipelineRun
 metadata:
   annotations:
     pipelinesascode.tekton.dev/cancel-in-progress: "true" # Cancel in-progress pipelines
-    pipelinesascode.tekton.dev/pipeline: "https://raw.githubusercontent.com/openshift-pipelines-konflux/tektoncd-operator/refs/heads/main/.tekton/docker-build-ta.yaml"
+    pipelinesascode.tekton.dev/pipeline: "https://raw.githubusercontent.com/openshift-pipelines/operator/refs/heads/main/.tekton/docker-build-ta.yaml"
     build.appstudio.openshift.io/repo: https://github.com/openshift-pipelines-konflux/tektoncd-hub.git?rev={{revision}}
     build.appstudio.redhat.com/commit_sha: '{{revision}}'
-    build.appstudio.redhat.com/pull_request_number: '{{pull_request_number}}'
     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
     pipelinesascode.tekton.dev/max-keep-runs: "3"
-    pipelinesascode.tekton.dev/on-cel-expression: event == "pull_request" && target_branch
+    pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch
       == "main" &&
       ("upstream/***".pathChanged() || ".konflux/patches/***".pathChanged() || ".konflux/rpms/***".pathChanged() ||
       ".konflux/dockerfiles/api.Dockerfile".pathChanged() ||
-      ".tekton/tektoncd-hub-main-api-pull-request.yaml".pathChanged())
+      ".tekton/tektoncd-hub-next-api-push.yaml".pathChanged())
+  creationTimestamp: null
   labels:
-    appstudio.openshift.io/application: openshift-pipelines-core-main
-    appstudio.openshift.io/component: tektoncd-hub-main-api
+    appstudio.openshift.io/application: openshift-pipelines-core-next
+    appstudio.openshift.io/component: tektoncd-hub-next-api
     pipelines.appstudio.openshift.io/type: build
-  name: tektoncd-hub-main-api-on-pull-request
-  namespace: tekton-ecosystem-tenant
+  name: tektoncd-hub-next-api-on-push
+  namespace: 
 spec:
   params:
   - name: git-url
@@ -28,21 +28,16 @@ spec:
   - name: revision
     value: '{{revision}}'
   - name: output-image
-    value: quay.io/redhat-user-workloads/tekton-ecosystem-tenant/hub-api-rhel9:on-pr-{{revision}}
-  - name: image-expires-after
-    value: 5d
+    value: quay.io/redhat-user-workloads//hub-api-rhel9:{{revision}}
   - name: dockerfile
     value: .konflux/dockerfiles/api.Dockerfile
-  - name: build-platforms
-    value:
-    - linux/x86_64
   - name: prefetch-input
     value: |
       {"type": "rpm", "path": ".konflux/rpms"}
   pipelineRef:
     name: docker-build-ta
   taskRunTemplate:
-    serviceAccountName: build-pipeline-tektoncd-hub-main-api
+    serviceAccountName: build-pipeline-tektoncd-hub-api-next
   workspaces:
   - name: git-auth
     secret:

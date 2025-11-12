@@ -12,15 +12,15 @@ metadata:
     pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch
       == "main" &&
       ("upstream/***".pathChanged() || ".konflux/patches/***".pathChanged() || ".konflux/rpms/***".pathChanged() ||
-      ".konflux/dockerfiles/api.Dockerfile".pathChanged() ||
-      ".tekton/tektoncd-hub-main-api-push.yaml".pathChanged())
+      ".konflux/dockerfiles/ui.Dockerfile".pathChanged() ||
+      ".tekton/tektoncd-hub-next-ui-push.yaml".pathChanged())
   creationTimestamp: null
   labels:
-    appstudio.openshift.io/application: openshift-pipelines-core-main
-    appstudio.openshift.io/component: tektoncd-hub-main-api
+    appstudio.openshift.io/application: openshift-pipelines-core-next
+    appstudio.openshift.io/component: tektoncd-hub-next-ui
     pipelines.appstudio.openshift.io/type: build
-  name: tektoncd-hub-main-api-on-push
-  namespace: tekton-ecosystem-tenant
+  name: tektoncd-hub-next-ui-on-push
+  namespace: 
 spec:
   params:
   - name: git-url
@@ -28,16 +28,16 @@ spec:
   - name: revision
     value: '{{revision}}'
   - name: output-image
-    value: quay.io/redhat-user-workloads/tekton-ecosystem-tenant/hub-api-rhel9:{{revision}}
+    value: quay.io/redhat-user-workloads//hub-ui-rhel9:{{revision}}
   - name: dockerfile
-    value: .konflux/dockerfiles/api.Dockerfile
+    value: .konflux/dockerfiles/ui.Dockerfile
   - name: prefetch-input
     value: |
-      {"type": "rpm", "path": ".konflux/rpms"}
+      [{"type": "npm", "path": "upstream/ui"}, {"type": "rpm", "path": ".konflux/rpms"}]
   pipelineRef:
     name: docker-build-ta
   taskRunTemplate:
-    serviceAccountName: build-pipeline-tektoncd-hub-main-api
+    serviceAccountName: build-pipeline-tektoncd-hub-ui-next
   workspaces:
   - name: git-auth
     secret:
